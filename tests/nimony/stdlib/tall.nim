@@ -21,14 +21,17 @@ import std/algorithm
 import std/appdirs
 import std/assertions
 import std/atomics
+import std/asyncio
 import std/base64
 import std/bitops
 import std/cmdline
+import std/commonio
 import std/compilation
 import std/complex
 import std/cpuinfo
 import std/deques
 import std/dirs
+import std/dns
 import std/editdistance
 import std/encodings
 import std/envvars
@@ -47,6 +50,7 @@ import std/ioring
 import std/json
 import std/lexbase
 import std/locks
+import std/logging
 import std/macros
 import std/math
 import std/md5
@@ -67,7 +71,7 @@ import std/parseutils
 import std/pathnorm
 import std/paths
 import std/random
-import std/regex
+import std/rex
 import std/rawthreads
 import std/result
 import std/rlocks

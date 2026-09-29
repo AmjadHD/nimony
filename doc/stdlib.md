@@ -194,6 +194,9 @@ available.
 - `tryWriteFile` is a convenience that opens, writes, and closes
   in one call.
 - `quit(msg)` writes to stderr and exits — useful for fatal errors.
+- `FileMode`, `FileSeekPos` and `FilePermission` live in
+  [`std/commonio`](../lib/std/commonio.nim), which `syncio` and the ring-based
+  `std/asyncio` both export, so importing both is not ambiguous.
 
 [Examples: file I/O](../examples/io_basics.nim)
 
@@ -407,6 +410,30 @@ Windows.
 - `wrapWords` handles Unicode graphemes correctly.
 - Set `splitLongWords = false` to keep long words intact instead of
   breaking them mid-word.
+
+
+## logging
+
+[Source](../lib/std/logging.nim)
+
+A port of Nim's `std/logging` whose log entries are lines of NIF in the
+line-based syntax, so a log file can be read back with
+`nifreader.open(file, lineBased = true)`:
+
+```nif
+info 2026-09-29T09:14:03Z "myapp" "server started on port 8080"
+```
+
+- The tag is the level (`debug`, `info`, `notice`, `warn`, `error`,
+  `fatal`); the message comes last as a string literal, escaped so that
+  an entry never spans more than one line.
+- `fmtStr` is not Nim's free-form prefix but a whitespace separated list of
+  fields between the tag and the message: `$date`, `$time`, `$datetime`,
+  `$app`, `$appname`, `$appdir`, `$levelid`, `$levelname`, or literal
+  words, which are written as strings. The default is `""`: no fields.
+- Times are UTC, like the rest of `std/times`, and `$datetime` says so
+  with a `Z`.
+- Handlers are thread-local, as in Nim.
 
 
 ## rawthreads
