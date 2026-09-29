@@ -3,8 +3,11 @@
 
 {.feature: "lenientnils".}
 
-import std / [tables, strutils, os, hashes, dirs, paths, syncio]
+import std / [tables, strutils, os, hashes, dirs, paths, syncio, osproc]
 import ../nifler2 / [nimgrammar, parserrt]
+import ../nifler2 / niflerout
+import ../lib / comesfrom
+import ../gear2 / modnames
 
 type
   SourceRange* = object
@@ -21,8 +24,17 @@ type
   ScopeNode* = object
     id*, parent*, indent*: int
 
+  SemanticSymbol* = object
+    name*, kind*, uri*: string
+    range*: SourceRange
+
+  SemanticSnapshot* = object
+    queried*, matched*: bool
+    visible*, candidates*: seq[SemanticSymbol]
+
   Document* = ref object
     uri*, path*: string
+    workspaceRoot*: string
     version*: int
     text*: string
     nodes*: seq[SyntaxNode]
@@ -30,6 +42,11 @@ type
     diagnostics*: seq[ParseDiagnostic]
     nifTree*: string
     cacheFile*: string
+    parsedFile*: string
+    moduleName*: string
+    queryCached*: bool
+    queryLine*, queryCharacter*: int
+    queryResult*: SemanticSnapshot
 
   Database* = object
     root*, cacheDir*: string
@@ -37,6 +54,21 @@ type
 
 const DeclKeywords = ["let", "var", "const", "type", "proc", "func",
                       "iterator", "template", "macro", "method", "converter"]
+
+proc compilerRoot(db: Database): string =
+  var dir = os.getAppDir()
+  for _ in 0 .. 7:
+    if os.fileExists(dir / "nimony"):
+      return if os.splitPath(dir).tail == "bin": os.parentDir(dir) else: dir
+    if os.fileExists(dir / "bin" / "nimony"): return dir
+    let parent = os.parentDir(dir)
+    if parent == dir: break
+    dir = parent
+  result = db.root
+
+proc modulePaths(db: Database): seq[string] =
+  let compilerRoot = db.compilerRoot
+  @[db.root, compilerRoot / "lib", compilerRoot / "src" / "lib"]
 
 proc initDatabase*(root: string): Database {.raises.} =
   let actualRoot = if root.len > 0: root else: os.getCurrentDir()
@@ -174,17 +206,24 @@ proc indexSyntax(doc: var Document) =
 
 proc updateDocument*(db: var Database; uri, path: string; version: int;
                      text: string): Document {.raises.} =
-  var doc = Document(uri: uri, path: path, version: version, text: text)
+  var doc = Document(uri: uri, path: path, workspaceRoot: db.root,
+                     version: version, text: text)
   var p = openParser(text, path, pool, globalTags)
   p.recovering = true
   parseModule p
   doc.diagnostics = p.errors
   let tree = finish(p)
   doc.nifTree = toString(tree)
-  p.close()
   doc.indexSyntax()
   let key = $hash(uri)
   doc.cacheFile = db.cacheDir / (key & ".nif")
+  doc.moduleName = moduleSuffix(path, db.modulePaths)
+  doc.parsedFile = db.cacheDir / (doc.moduleName & ".p.nif")
+  writeNifler(p.first, p.pool, p.tags, cellCount(p.arena) * 8,
+              doc.parsedFile, path)
+  writeDeps(p.first, p.pool, p.tags,
+            db.cacheDir / (doc.moduleName & ".p.deps.nif"))
+  p.close()
   try:
     writeFile(doc.cacheFile, doc.nifTree)
   except:
@@ -195,8 +234,16 @@ proc updateDocument*(db: var Database; uri, path: string; version: int;
 proc closeDocument*(db: var Database; uri: string) {.raises.} =
   if db.documents.hasKey(uri):
     let cacheFile = db.documents.getOrDefault(uri).cacheFile
+    let parsedFile = db.documents.getOrDefault(uri).parsedFile
+    let depsFile = db.cacheDir / (db.documents.getOrDefault(uri).moduleName & ".p.deps.nif")
+    let ideFile = db.cacheDir / (db.documents.getOrDefault(uri).moduleName & ".ide.tsv")
+    let semFile = db.cacheDir / (db.documents.getOrDefault(uri).moduleName & ".s.nif")
     try:
-      if fileExists(cacheFile): removeFile(path(cacheFile))
+      if os.fileExists(cacheFile): removeFile(path(cacheFile))
+      if os.fileExists(parsedFile): removeFile(path(parsedFile))
+      if os.fileExists(depsFile): removeFile(path(depsFile))
+      if os.fileExists(ideFile): removeFile(path(ideFile))
+      if os.fileExists(semFile): removeFile(path(semFile))
     except:
       discard
     db.documents.del(uri)
@@ -254,6 +301,137 @@ proc positionOffset(doc: Document; line, character: int): int =
     width += utf16Width(doc.text[result])
     inc result
 
+proc utf16Column(text: string; line, byteColumn: int): int =
+  result = 0
+  var currentLine = 1
+  var offset = 0
+  while offset < text.len and currentLine < line:
+    if text[offset] == '\n': inc currentLine
+    inc offset
+  let lineEnd = min(text.len, offset + max(0, byteColumn))
+  while offset < lineEnd:
+    result += utf16Width(text[offset])
+    inc offset
+
+proc sourceRange(doc: Document; source: string; line, col: int;
+                 name: string): SourceRange {.raises.} =
+  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  var text = ""
+  if path == doc.path: text = doc.text
+  else:
+    try: text = readFile(path)
+    except: discard
+  var byteColumn = col
+  if text.len > 0 and name.len > 0:
+    var start = 0
+    var currentLine = 1
+    while start < text.len and currentLine < line:
+      if text[start] == '\n': inc currentLine
+      inc start
+    var stop = start
+    while stop < text.len and text[stop] != '\n': inc stop
+    var i = min(stop, start + max(0, col))
+    while i + name.len <= stop:
+      var matches = text.substr(i, i + name.len - 1) == name
+      if name[0] in {'a'..'z', 'A'..'Z', '_'} or ord(name[0]) >= 0x80:
+        matches = matches and
+          (i == start or not isIdentContinue(text[i - 1])) and
+          (i + name.len == stop or not isIdentContinue(text[i + name.len]))
+      if matches:
+        byteColumn = i - start
+        break
+      inc i
+  var width = name.len
+  if text.len > 0:
+    var nameWidth = 0
+    for c in name: nameWidth += utf16Width(c)
+    width = nameWidth
+  let lineNo = max(0, line - 1)
+  let column = if text.len > 0: utf16Column(text, line, byteColumn) else: col
+  SourceRange(startLine: lineNo, startCharacter: column,
+              endLine: lineNo, endCharacter: column + width)
+
+proc uriForPath(doc: Document; source: string): string =
+  if source == doc.path: return doc.uri
+  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  result = "file://"
+  const Hex = "0123456789ABCDEF"
+  for c in path:
+    if c in {'a'..'z', 'A'..'Z', '0'..'9', '-', '_', '.', '~', '/', ':'}:
+      result.add c
+    else:
+      result.add '%'
+      result.add Hex[(ord(c) shr 4) and 0xF]
+      result.add Hex[ord(c) and 0xF]
+
+proc resolveNameAt(doc: Document; name: string; line, character: int): seq[int]
+
+proc parseIdeSnapshot(doc: Document; content: string; queryLine,
+                      queryCharacter: int): SemanticSnapshot {.raises.} =
+  result = SemanticSnapshot(queried: true, matched: false,
+                           visible: @[], candidates: @[])
+  for line in content.splitLines:
+    let fields = line.split('\t')
+    if fields.len == 2 and fields[0] == "matched":
+      result.matched = fields[1] == "true"
+    elif fields.len >= 7 and fields[0] in ["visible", "candidate"]:
+      var lineNo, column = 0
+      try:
+        lineNo = parseInt(fields[4])
+        column = parseInt(fields[5])
+      except:
+        continue
+      let source = if fields[3].len > 0: realFile(fields[3]) else: ""
+      let isLocal = fields[6] == "true"
+      if isLocal or source == doc.path:
+        for id in doc.resolveNameAt(fields[1], queryLine, queryCharacter):
+          let n = doc.nodes[id]
+          let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
+            uri: doc.uri, range: n.range)
+          if fields[0] == "visible": result.visible.add symbol
+          else: result.candidates.add symbol
+      elif source.len > 0:
+        let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
+          uri: doc.uriForPath(source),
+          range: doc.sourceRange(source, lineNo, column, fields[1]))
+        if fields[0] == "visible": result.visible.add symbol
+        else: result.candidates.add symbol
+      else:
+        let symbol = SemanticSymbol(name: fields[1], kind: fields[2], uri: "",
+                                    range: SourceRange())
+        if fields[0] == "visible": result.visible.add symbol
+        else: result.candidates.add symbol
+
+proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSnapshot {.raises.} =
+  if doc.queryCached and doc.queryLine == line and doc.queryCharacter == character:
+    return doc.queryResult
+  result = SemanticSnapshot(queried: true, matched: false,
+                            visible: @[], candidates: @[])
+  let offset = doc.positionOffset(line, character)
+  var lineStart = offset
+  while lineStart > 0 and doc.text[lineStart - 1] != '\n': dec lineStart
+  let compiler = db.compilerRoot / "bin" / "nimony"
+  let semFile = db.cacheDir / (doc.moduleName & ".s.nif")
+  let ideFile = db.cacheDir / (doc.moduleName & ".ide.tsv")
+  try:
+    if os.fileExists(semFile): removeFile(path(semFile))
+    if os.fileExists(ideFile): removeFile(path(ideFile))
+  except:
+    discard
+  let track = doc.path & "," & $(line + 1) & "," & $(offset - lineStart + 1)
+  var command = quoteShell(compiler) & " --base:" & quoteShell(db.root) &
+    " --nimcache:" & quoteShell(db.cacheDir)
+  for searchPath in db.modulePaths:
+    command.add " --path:" & quoteShell(searchPath)
+  command.add " check " & quoteShell(doc.parsedFile) &
+    " --visible:" & quoteShell(track)
+  let _ = execCmdEx(command, workingDir = db.root)
+  if os.fileExists(ideFile): result = parseIdeSnapshot(doc, readFile(ideFile), line, character)
+  doc.queryCached = true
+  doc.queryLine = line
+  doc.queryCharacter = character
+  doc.queryResult = result
+
 proc isMemberAccess*(doc: Document; line, character: int): bool =
   var offset = doc.positionOffset(line, character)
   while offset > 0 and doc.text[offset - 1] in {' ', '\t'}: dec offset
@@ -275,6 +453,28 @@ proc scopeAtLine(doc: Document; line: int): int =
     if scope.indent <= indent and scope.indent > bestIndent:
       bestIndent = scope.indent
       result = scope.id
+
+proc resolveNameAt(doc: Document; name: string; line, character: int): seq[int] =
+  result = @[]
+  if doc.isMemberAccess(line, character): return
+  let nodeId = doc.nodeAt(line, character)
+  let scope = if nodeId >= 0: doc.nodes[nodeId].scope else: doc.scopeAtLine(line)
+  let offset = if nodeId >= 0: doc.nodes[nodeId].startOffset
+               else: doc.positionOffset(line, character)
+  var nearestDepth = -1
+  for candidate in doc.nodes:
+    if candidate.declarationKind.len == 0 or candidate.text != name: continue
+    if not doc.scopeContains(candidate.scope, scope): continue
+    if candidate.scope != 0 and candidate.startOffset > offset: continue
+    var depth = 0
+    var parent = candidate.scope
+    while parent > 0:
+      inc depth
+      parent = doc.scopes[parent].parent
+    if depth > nearestDepth:
+      result.setLen(0)
+      nearestDepth = depth
+    if depth == nearestDepth: result.add candidate.id
 
 proc visible*(doc: Document; line, character: int): seq[int] =
   result = @[]

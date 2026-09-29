@@ -214,6 +214,75 @@ proc visibleDeclarationAtCursor*(c: var SemContext; identifier: StrId;
   result = createTokenBuf(8)
   discard buildSymChoice(c, result, identifier, info, InnerMost)
 
+proc ideSymbol(c: var SemContext; dest: TokenBuf; id: SymId): IdeSymbol =
+  result = IdeSymbol(id: id, kind: NoSym, info: NoLineInfo)
+  var scope = c.currentScope
+  while scope != nil:
+    for _, symbols in scope.tab:
+      for sym in symbols:
+        if sym.name == id:
+          result.kind = sym.kind
+          if sym.pos >= 0 and sym.pos < dest.len:
+            result.info = readonlyCursorAt(dest, sym.pos).info
+          if result.info.isValid: return
+    scope = scope.up
+  let loaded = tryLoadSym(id)
+  if loaded.status == LacksNothing:
+    result.kind = loaded.decl.symKind
+    result.info = loaded.decl.info
+
+proc symbolUses(buf: var TokenBuf): seq[SymId] =
+  result = @[]
+  var choice = beginRead(buf)
+  if choice.isTagLit:
+    var child = childCursor(choice)
+    while child.hasMore:
+      if child.isSymbol:
+        var seen = false
+        for sym in result:
+          if sym == child.symId:
+            seen = true
+            break
+        if not seen: result.add child.symId
+      inc child
+    endRead child
+  endRead choice
+
+proc visibleDeclarationsAtCursor*(c: var SemContext; identifier: StrId;
+                                  info: NifLineInfo; dest: TokenBuf): seq[IdeSymbol] =
+  result = @[]
+  var choice = c.visibleDeclarationAtCursor(identifier, info)
+  for id in symbolUses(choice): result.add c.ideSymbol(dest, id)
+
+proc visibleSymbolsAtCursor*(c: var SemContext; dest: TokenBuf;
+                             info: NifLineInfo): seq[IdeSymbol] =
+  ## List ordinary lexical lookup results for every name visible in the active
+  ## scope chain and imports. This is observational and does not invoke
+  ## overload matching or type inference.
+  result = @[]
+  var names = initHashSet[StrId]()
+  var scope = c.currentScope
+  while scope != nil:
+    for name in keys(scope.tab): names.incl name
+    scope = scope.up
+  for name in keys(c.importTab): names.incl name
+
+  for name in names:
+    var choice = c.visibleDeclarationAtCursor(name, info)
+    for sym in symbolUses(choice):
+      var seen = false
+      for existing in result:
+        if existing.id == sym:
+          seen = true
+          break
+      if not seen: result.add c.ideSymbol(dest, sym)
+
+  for i in 1 ..< result.len:
+    var j = i
+    while j > 0 and pool.symString(result[j].id) < pool.symString(result[j-1].id):
+      swap result[j], result[j-1]
+      dec j
+
 proc addSymChoiceSyms*(c: var SemContext; dest: var TokenBuf; identifier: StrId; marker: var HashSet[SymId]; info: NifLineInfo) =
   # like rawBuildSymChoice but adds to an existing symchoice, ignoring duplicates
   let ignoreStyle = IgnoreStyleFeature in c.features

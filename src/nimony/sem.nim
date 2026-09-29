@@ -1440,6 +1440,21 @@ proc patchType(c: var SemContext; dest: var TokenBuf; typ: TypeCursor; patchPosi
   let t = skipModifier(typ)
   dest.replace t, patchPosition
 
+proc cursorMatchesName(info: NifLineInfo; name: StrId; query: IdeQuery): bool =
+  if not query.enabled or not info.file.isValid or info.file != query.info.file or
+      info.line != query.info.line:
+    return false
+  let nameLen = pool.strings[name].len
+  query.info.col >= info.col and query.info.col < info.col + nameLen and
+    (query.name == StrId(0) or query.name == name)
+
+proc captureIdeName(c: var SemContext; dest: var TokenBuf; ident: StrId;
+                     info: NifLineInfo) =
+  if c.ideQuery.matched or not cursorMatchesName(info, ident, c.ideQuery): return
+  c.ideQuery.candidates = c.visibleDeclarationsAtCursor(ident, info, dest)
+  c.ideQuery.visible = c.visibleSymbolsAtCursor(dest, c.ideQuery.info)
+  c.ideQuery.matched = true
+
 proc uniqueTypeCandidate(c: var SemContext; dest: var TokenBuf; choiceAt: int): SymId =
   ## The one type in the symbol choice at `choiceAt`, or `SymId(0)` if there are
   ## none or several.
@@ -1475,6 +1490,7 @@ proc semIdentImpl(c: var SemContext; dest: var TokenBuf; n: var Cursor; ident: S
     dest.shrink insertPos
     discard resolveDeferredLocal(c, ident)
     count = buildSymChoice(c, dest, ident, info, mode, nearestIsUnique)
+  c.captureIdeName(dest, ident, info)
   if count > 1 and PreferTypes in flags:
     # In a type position only a type can stand, so its one type candidate is
     # what the name means, as in Nim: nifcore's enum field `NifKind.Symbol`
@@ -5948,4 +5964,3 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
     buildErr c, dest, it.n.info, "expression expected"
     if it.n.isDotToken or it.n.isUnknownToken:
       inc it.n
-

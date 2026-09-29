@@ -83,17 +83,33 @@ proc docPosition(params: JsonNode): tuple[line, character: int] =
   let pos = field(params, "position")
   (int(getInt(field(pos, "line"))), int(getInt(field(pos, "character"))))
 
-proc definitionJson(doc: Document; nodeId: int): string =
+proc definitionJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   result = "["
-  let resolved = doc.resolve(nodeId)
-  for i, id in resolved:
-    if i > 0: result.add ','
-    let n = doc.nodes[id]
-    result.add "{\"uri\":" & quoteJson(doc.uri) &
-      ",\"range\":" & rangeJson(n.range) & "}"
+  if query.queried:
+    var first = true
+    if query.matched:
+      for symbol in query.candidates:
+        if symbol.uri.len == 0: continue
+        if not first: result.add ','
+        first = false
+        result.add "{\"uri\":" & quoteJson(symbol.uri) &
+          ",\"range\":" & rangeJson(symbol.range) & "}"
+  else:
+    let resolved = doc.resolve(nodeId)
+    for i, id in resolved:
+      if i > 0: result.add ','
+      let n = doc.nodes[id]
+      result.add "{\"uri\":" & quoteJson(doc.uri) &
+        ",\"range\":" & rangeJson(n.range) & "}"
   result.add ']'
 
-proc hoverJson(doc: Document; nodeId: int): string =
+proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
+  if query.queried:
+    if query.candidates.len == 0: return "null"
+    let symbol = query.candidates[0]
+    return "{\"contents\":{\"kind\":\"markdown\",\"value\":" &
+      quoteJson("`" & symbol.kind & " " & symbol.name & "`") &
+      "},\"range\":" & rangeJson(symbol.range) & "}"
   let resolved = doc.resolve(nodeId)
   if resolved.len == 0: return "null"
   let n = doc.nodes[resolved[0]]
@@ -102,22 +118,33 @@ proc hoverJson(doc: Document; nodeId: int): string =
     quoteJson("`" & kindName & " " & n.text & "`") &
     "},\"range\":" & rangeJson(doc.nodes[nodeId].range) & "}"
 
-proc completionJson(doc: Document; line, character: int): string =
+proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot): string =
   if doc.isMemberAccess(line, character):
     return "{\"isIncomplete\":false,\"items\":[]}"
   result = "{\"isIncomplete\":false,\"items\":["
-  let visible = doc.visible(line, character)
   var labels = initHashSet[string]()
   var first = true
-  for id in visible:
-    let n = doc.nodes[id]
-    if n.text in labels: continue
-    labels.incl n.text
-    if not first: result.add ','
-    first = false
-    let kind = if n.declarationKind in ["proc", "func", "iterator", "method"]: 3 else: 6
-    result.add "{\"label\":" & quoteJson(n.text) & ",\"kind\":" & $kind &
-      ",\"detail\":" & quoteJson(n.declarationKind) & "}"
+  if query.queried and query.matched:
+    for symbol in query.visible:
+      let name = symbol.name
+      if name in labels: continue
+      labels.incl name
+      if not first: result.add ','
+      first = false
+      let kind = if symbol.kind in ["proc", "func", "iterator", "method",
+                                    "template", "macro", "converter"]: 3 else: 6
+      result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
+        ",\"detail\":" & quoteJson(symbol.kind) & "}"
+  else:
+    for id in doc.visible(line, character):
+      let n = doc.nodes[id]
+      if n.text in labels: continue
+      labels.incl n.text
+      if not first: result.add ','
+      first = false
+      let kind = if n.declarationKind in ["proc", "func", "iterator", "method"]: 3 else: 6
+      result.add "{\"label\":" & quoteJson(n.text) & ",\"kind\":" & $kind &
+        ",\"detail\":" & quoteJson(n.declarationKind) & "}"
   result.add "]}"
 
 proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
@@ -167,10 +194,14 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
     if doc != nil:
       let pos = docPosition(params)
       let nodeId = doc.nodeAt(pos.line, pos.character)
+      let query = if nodeId >= 0:
+          db.ideQueryAt(doc, pos.line, pos.character)
+        else:
+          SemanticSnapshot()
       case methodName
-      of "textDocument/completion": value = completionJson(doc, pos.line, pos.character)
-      of "textDocument/hover": value = hoverJson(doc, nodeId)
-      else: value = definitionJson(doc, nodeId)
+      of "textDocument/completion": value = completionJson(doc, pos.line, pos.character, query)
+      of "textDocument/hover": value = hoverJson(doc, nodeId, query)
+      else: value = definitionJson(doc, nodeId, query)
     result.response = "{\"jsonrpc\":\"2.0\",\"id\":" & idText &
       ",\"result\":" & value & "}"
   of "shutdown":

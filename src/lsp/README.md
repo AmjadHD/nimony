@@ -6,12 +6,15 @@ initialize/shutdown, full document synchronization, diagnostics, completion,
 hover, and go-to-definition.
 
 The document database stores syntax-token nodes with source ranges and lexical
-scope identities. An edit currently reparses and reindexes its containing
-document; the semantic name index is therefore module-granular in this first
-shippable version. This is an explicit boundary: node-granular semantic cache
-invalidation is not provided by Nimony's existing incremental build graph.
-LSP parse snapshots are written only below `nimcache/lsp/`; batch compilation
-does not read that namespace, and LSP does not trust batch cache artifacts.
+scope identities. For identifier queries, the server invokes `nimony check`
+with `--visible`; phase 3 captures the active `SemContext` scope-chain results
+and resolved name candidates. The query path retains `ErrT` nodes and returns
+its snapshot rather than failing on semantic errors elsewhere in the module.
+An edit reparses and rechecks its containing document, while individual syntax
+nodes remain the database records. This is an explicit boundary: Nimony's
+existing incremental build graph does not provide node-granular semantic
+invalidation. LSP parser, dependency, and semantic artifacts live only below
+`nimcache/lsp/`; batch compilation never reads them.
 
 Parser recovery is a safe in-place extension because it preserves the grammar's
 ordinary FIRST/FOLLOW analysis and emits balanced `(err ...)` nodes only when
@@ -23,7 +26,8 @@ completion sites return no result rather than a guessed answer. Signature help
 and best-effort resolution of unknown argument types remain a separate future
 design phase and should be evaluated after editing-session experience.
 
-The current editor-side declaration index is lexical and document-local. It
-provides useful navigation and scope completions across unrelated parser
-errors, while the semantic API `visibleDeclarationAtCursor` exposes Nimony's
-existing scope-chain lookup for use by semantic-walker integrations.
+The lexical index remains a fallback for positions without a semantic identifier
+node, such as a blank completion line. Semantic name lookup tolerates unrelated
+parser and type errors by returning the cursor's phase-3 scope snapshot without
+running `sigmatch`. Type-dependent member/call results remain empty when they
+cannot be established without inference.

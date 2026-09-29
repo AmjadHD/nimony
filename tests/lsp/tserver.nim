@@ -4,25 +4,34 @@ import ../../src/lsp/[database, handlers]
 proc runTests() {.raises.} =
   var db = initDatabase(getCurrentDir())
   let uri = "file:///workspace/lsp-test.nim"
-  let opened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim","version":1,"text":"let broken = (1\nlet global = 1\nproc f() =\n  let global = 2\n  let local = global\n  local\n  global.\n  \n"}}}""")
+  let opened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim","version":1,"text":"let broken = (1\nlet typedBroken: UnknownType = 1\nimport std/strutils\nlet global = 1\nproc f() =\n  let global = 2\n  let local = global\n  let found = contains(\"x\", \"x\")\n  local\n  global.\n  \n"}}}""")
   assert opened.notification.contains("publishDiagnostics")
   assert opened.notification.contains("expected")
 
-  let definition = handle(db, """{"jsonrpc":"2.0","id":1,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":5,"character":3}}}""")
-  assert definition.response.contains("\"line\":4")
+  let definition = handle(db, """{"jsonrpc":"2.0","id":1,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
+  assert definition.response.contains("\"line\":6")
   assert definition.response.contains("\"character\":6")
 
-  let shadowed = handle(db, """{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":4,"character":16}}}""")
-  assert shadowed.response.contains("\"line\":3")
+  let shadowed = handle(db, """{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":6,"character":16}}}""")
+  assert shadowed.response.contains("\"line\":5")
   assert shadowed.response.contains("\"character\":6")
 
-  let hover = handle(db, """{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":5,"character":3}}}""")
+  let importedDefinition = handle(db, """{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":7,"character":16}}}""")
+  assert importedDefinition.response.contains("lib/std/strutils.nim")
+  assert importedDefinition.response.contains("\"character\":5")
+
+  let hover = handle(db, """{"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
   assert hover.response.contains("let local")
 
-  let postDot = handle(db, """{"jsonrpc":"2.0","id":4,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":6,"character":9}}}""")
+  let semanticCompletion = handle(db, """{"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
+  assert semanticCompletion.response.contains("\"label\":\"local\"")
+  assert semanticCompletion.response.contains("\"label\":\"global\"")
+  assert semanticCompletion.response.contains("\"label\":\"contains\"")
+
+  let postDot = handle(db, """{"jsonrpc":"2.0","id":6,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":9,"character":9}}}""")
   assert postDot.response.contains("\"items\":[]")
 
-  let completion = handle(db, """{"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":7,"character":2}}}""")
+  let completion = handle(db, """{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":10,"character":2}}}""")
   assert completion.response.contains("\"label\":\"local\"")
   assert completion.response.contains("\"label\":\"global\"")
 

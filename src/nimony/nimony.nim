@@ -98,8 +98,9 @@ Options:
   --outdir:DIR              put the executable in DIR (default = cwd).
                             Same semantics as Nim's --outdir.
   --boundchecks:on|off      turn bound checks on or off
-  --usages:file,line,col    list usages of the symbol at the given position
-  --def:file,line,col       list definition of the symbol at the given position
+   --usages:file,line,col    list usages of the symbol at the given position
+   --def:file,line,col       list definition of the symbol at the given position
+   --visible:file,line,col   expose phase-3 visible names at the given position
   --cc:C_COMPILER           set the C compiler; can be a path to the compiler's
                             executable or a name
   --linker:LINKER           set the linker

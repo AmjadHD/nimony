@@ -88,7 +88,7 @@ proc toMM*(val: string): string =
 
 type
   TrackMode* = enum
-    TrackNone, TrackUsages, TrackDef
+    TrackNone, TrackUsages, TrackDef, TrackVisible
   TrackPosition* = object
     mode*: TrackMode
     line*, col*: int32

@@ -1968,7 +1968,7 @@ proc generateFrontendBuildFile(c: DepContext; commandLineArgs: string; cmd: Comm
             b.withTree "output":
               b.addStrLit f
 
-    if cmd == DoCheck and c.config.toTrack.mode != TrackNone:
+    if cmd == DoCheck and c.config.toTrack.mode in {TrackUsages, TrackDef}:
       b.withTree "do":
         b.addIdent "idetools"
         for v in c.nodes:

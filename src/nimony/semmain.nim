@@ -224,6 +224,23 @@ proc semToplevelStmts(c: var SemContext; dest: var TokenBuf; buf: var TokenBuf) 
     while n.hasMore:
       semStmt c, dest, n, false
 
+proc writeIdeQuery(c: SemContext) =
+  var output = "matched\t" & $c.ideQuery.matched & "\n"
+  for symbol in c.ideQuery.visible:
+    let file = if symbol.info.file.isValid: pool.filenames[symbol.info.file] else: ""
+    output.add "visible\t" & pool.symBasename(symbol.id) & "\t" & $symbol.kind &
+      "\t" & file & "\t" & $symbol.info.line &
+      "\t" & $symbol.info.col & "\t" &
+      $(pool.symModule(symbol.id) == c.thisModuleSuffix) & "\n"
+  for symbol in c.ideQuery.candidates:
+    let file = if symbol.info.file.isValid: pool.filenames[symbol.info.file] else: ""
+    output.add "candidate\t" & pool.symBasename(symbol.id) & "\t" & $symbol.kind &
+      "\t" & file & "\t" & $symbol.info.line &
+      "\t" & $symbol.info.col & "\t" &
+      $(pool.symModule(symbol.id) == c.thisModuleSuffix) & "\n"
+  let path = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".ide.tsv"
+  onRaiseQuit writeFile(path, output)
+
 proc phase1(c: var SemContext; dest: var TokenBuf; n: Cursor): (TokenBuf, NifLineInfo) =
   ## Phase 1: Register toplevel symbols.
   phaseX(c, dest, n, SemcheckTopLevelSyms)
@@ -252,6 +269,14 @@ proc phase3(c: var SemContext; buf: var TokenBuf; moduleLineInfo: NifLineInfo): 
   result = createTokenBuf(buf.len + buf.len div 2)
   result.addParLe(StmtsS, moduleLineInfo)
   semToplevelStmts(c, result, buf)
+
+proc enableIdeQuery(c: var SemContext; source: string) =
+  let track = c.g.config.toTrack
+  if track.mode == TrackVisible and realFile(track.filename) == realFile(source):
+    c.ideQuery = IdeQuery(enabled: true,
+      info: NifLineInfo(file: pool.filenames.getOrIncl(track.filename),
+                        line: track.line, col: track.col),
+      name: StrId(0), visible: @[], candidates: @[])
 
 proc requestHookInstance(c: var SemContext; decl: Cursor) =
   let decl = asTypeDecl(decl)
@@ -518,6 +543,7 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
 
   assert n0.stmtKind == StmtsS
   let path = getFile(n0.info) # gets current module path, maybe there is a better way
+  c.enableIdeQuery(path)
   addSelfModuleSym(c, path)
 
   if {SkipSystem, IsSystem} * c.moduleFlags == {}:
@@ -525,6 +551,16 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
     importSingleFile(c, dest, systemFile, "", ImportFilter(kind: ImportAll), n0.info)
 
   runPhases(c, dest, n0)
+
+  # An editor query needs the scope and name choices produced during phase 3,
+  # not the later lowering passes. Leave semantic error nodes in the partial
+  # tree and return the query snapshot instead of making an editor parse fatal.
+  if c.ideQuery.enabled:
+    dest.addParRi()
+    writeIdeQuery c
+    let outfile = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".s.nif"
+    writeOutput c, dest, outfile
+    return
 
   if c.expanded.len > 0:
     dest.addParLe CommentS, readonlyCursorAt(c.expanded, 0).info
@@ -695,6 +731,7 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
   for i in 0..<modules.len:
     modules[i].c.currentScope = Scope(tab: initTable[StrId, seq[Sym]](), kind: ToplevelScope)
     let path = getFile(modules[i].n0.info)
+    modules[i].c.enableIdeQuery(path)
     addSelfModuleSym(modules[i].c, path)
     if {SkipSystem, IsSystem} * moduleFlags == {}:
       let systemFile = ImportedFilename(path: stdlibFile("std/system"), name: "system", isSystem: true)
@@ -730,12 +767,17 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
 
   # Post-processing and output for each module
   for i in 0..<modules.len:
-    semcheckPostProcess modules[i].c, modules[i].dest
-    if reportErrors(modules[i].dest) == 0:
-      maybeValidatePostSem modules[i].dest, modules[i].outfile
+    if modules[i].c.ideQuery.enabled:
+      modules[i].dest.addParRi()
+      writeIdeQuery modules[i].c
       writeOutput modules[i].c, modules[i].dest, modules[i].outfile
     else:
-      quit 1
+      semcheckPostProcess modules[i].c, modules[i].dest
+      if reportErrors(modules[i].dest) == 0:
+        maybeValidatePostSem modules[i].dest, modules[i].outfile
+        writeOutput modules[i].c, modules[i].dest, modules[i].outfile
+      else:
+        quit 1
 
 proc semcheck*(infiles, outfiles: seq[string]; config: sink NifConfig; moduleFlags: set[ModuleFlag];
                commandLineArgs, hostCommandLineArgs: sink string; canSelfExec: bool) =
@@ -767,6 +809,7 @@ proc semcheck*(infiles, outfiles: seq[string]; config: sink NifConfig; moduleFla
     if not c.hasPendingPlugins: break
     handleTypePlugins c, dest
 
+  if c.ideQuery.enabled: return
   if reportErrors(dest) == 0:
     maybeValidatePostSem dest, outfile
     writeOutput c, dest, outfile

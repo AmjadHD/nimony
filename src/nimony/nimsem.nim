@@ -44,6 +44,7 @@ Options:
                             set the application type (default: console)
   --base:PATH               set the base directory for the configuration system
   --nimcache:PATH           set the path used for generated files
+  --visible:file,line,col   capture visible names for an editor query
   --flags:FLAGS             undocumented flags
   --novalidate              skip running the plugin validator on plugin sources
   --verbose                 dump Final IR (and other diagnostics) on contract
@@ -185,6 +186,8 @@ proc handleCmdLine() =
     case config.toTrack.mode
     of TrackUsages, TrackDef:
       usages(args, config)
+    of TrackVisible:
+      discard "the visibility snapshot was written by semmain"
     of TrackNone:
       quit "no --track information provided"
 

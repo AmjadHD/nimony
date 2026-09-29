@@ -136,6 +136,17 @@ type
     module*: string
     file*: uint32
 
+  IdeSymbol* = object
+    id*: SymId
+    kind*: SymKind
+    info*: NifLineInfo
+
+  IdeQuery* = object
+    enabled*, matched*: bool
+    info*: NifLineInfo
+    name*: StrId
+    visible*, candidates*: seq[IdeSymbol]
+
   # SemPhase and ToplevelEntry are now in programs.nim
 
   MetaInfo* = object
@@ -174,6 +185,7 @@ type
     #dest*: TokenBuf
     routine*: SemRoutine
     currentScope*: Scope
+    ideQuery*: IdeQuery
     g*: ProgramContext
     procRequests*: seq[InstRequest]
     typeInstDecls*: seq[SymId]
@@ -393,4 +405,3 @@ proc typeToCursor*(c: var SemContext; buf: TokenBuf; start: int): TypeCursor =
 template emptyNode*(c: var SemContext): Cursor =
   # XXX find a better solution for this
   c.types.voidType
-

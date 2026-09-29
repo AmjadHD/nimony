@@ -179,6 +179,11 @@ proc parseCommonOption*(key, val: string; config: var NifConfig;
       config.toTrack = parseTrack(val, TrackDef)
     else:
       quit "only one --usages or --def can be used"
+  of "visible":
+    if config.toTrack.mode == TrackNone:
+      config.toTrack = parseTrack(val, TrackVisible)
+    else:
+      quit "only one IDE query can be used"
   of "flags":
     # Flags are forwarded but not processed here
     discard
