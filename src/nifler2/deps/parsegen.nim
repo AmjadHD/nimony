@@ -1920,8 +1920,19 @@ proc emitParser(e: var Emitter; inp: Input): Code =
   # "can this rule start here" for the predicated rules: a caller's loop test
   # has to respect the predicate, and a FIRST set cannot express one.
   var canProcs: seq[Code] = @[]
+  var syncProcs: seq[Code] = @[]
   var ruleProcs: seq[Code] = @[]
   for r in g.order:
+    let syncParams = code(cParams, "", [code(cParam, "p", [id("Parser")])])
+    let firstName = "sync" & capitalizeAscii(r) & "First"
+    let followName = "sync" & capitalizeAscii(r) & "Follow"
+    syncProcs.add code(cProc, firstName,
+      [syncParams, id("bool"), code(cStmts, "", [
+        asgn(id("result"), condFor(g.first.getOrDefault(r)))])])
+    syncProcs.add code(cProc, followName,
+      [syncParams, id("bool"), code(cStmts, "", [
+        asgn(id("result"), condFor(g.follow.getOrDefault(r)))])])
+
     curInfo = inp.infos.getOrDefault(r)
     let canName = "can" & capitalizeAscii(r)
     let canParams = paramList(g, r, code(cParam, "p", [id("Parser")]), false)
@@ -1937,6 +1948,7 @@ proc emitParser(e: var Emitter; inp: Input): Code =
     e.curRule = r
     e.tmp = 0
     e.cur = stmts()
+    e.line call("pushRecovery", [p(), id(firstName), id(followName)])
     e.line letC("m0", markCall())
     var bodies: seq[Alt] = @[]
     for a in g.rules.getOrDefault(r):
@@ -1948,7 +1960,9 @@ proc emitParser(e: var Emitter; inp: Input): Code =
     if not (bodies.len == 1 and bodies[0].items.len == 0 and bodies[0].tag.len == 0):
       emitAlts(e, bodies, r, "m0", if e.needsAnchor.contains(r): "anchor" else: "m0")
     e.line call("discardUnused", [id("m0")])
+    e.line call("popRecovery", [p()])
     ruleProcs.add code(cProc, procName(r), [pParams, code(cEmpty), e.cur])
+  for c in syncProcs: result.kids.add c
   for c in canProcs: result.kids.add c
   for c in ruleProcs: result.kids.add c
 

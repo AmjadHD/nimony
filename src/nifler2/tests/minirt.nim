@@ -53,6 +53,8 @@ type
     buf*: seq[BufTok]
     errors*: seq[string]
 
+  SyncPredicate* = proc (p: Parser): bool {.nimcall.}
+
 proc tok*(p: Parser): Token = p.toks[p.pos]
 
 # --------------------------------------------------------------- lexing
@@ -172,6 +174,9 @@ proc expect*(p: var Parser; k: TokKind) =
   else: error p, "expected '" & $k & "'"
 
 proc mark*(p: Parser): Mark = Mark(pos: p.buf.len)
+
+proc pushRecovery*(p: var Parser; first, follow: SyncPredicate) = discard
+proc popRecovery*(p: var Parser) = discard
 
 # ---- what the generated code needs for `binary(...)` and `&predicates`
 

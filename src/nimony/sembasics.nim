@@ -206,6 +206,14 @@ proc buildSymChoice*(c: var SemContext; dest: var TokenBuf; identifier: StrId; i
   var nearestIsUnique = false
   result = buildSymChoice(c, dest, identifier, info, option, nearestIsUnique)
 
+proc visibleDeclarationAtCursor*(c: var SemContext; identifier: StrId;
+                                 info: NifLineInfo): TokenBuf =
+  ## Observe ordinary name lookup at the current semantic cursor. Call while
+  ## the semantic walker has entered the cursor's scopes; this deliberately
+  ## does not invoke sigmatch or infer types for incomplete expressions.
+  result = createTokenBuf(8)
+  discard buildSymChoice(c, result, identifier, info, InnerMost)
+
 proc addSymChoiceSyms*(c: var SemContext; dest: var TokenBuf; identifier: StrId; marker: var HashSet[SymId]; info: NifLineInfo) =
   # like rawBuildSymChoice but adds to an existing symchoice, ignoring duplicates
   let ignoreStyle = IgnoreStyleFeature in c.features

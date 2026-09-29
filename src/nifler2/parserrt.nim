@@ -101,9 +101,18 @@ type
     wrapFields: seq[bool]  ## whether a multi-name field is wrapped in `stmts`
     pool*: Pool            ## the literals pool the cells intern into
     tags*: TagPool         ## the tag pool a flattened buffer is built with
-    failed*: bool          ## a syntax error ended the parse; see `errorAt`
+    failed*: bool          ## a batch syntax error ended the parse; see `errorAt`
+    recovering*: bool      ## opt-in error recovery for editor parses
+    errors*: seq[ParseDiagnostic] ## recovered parser diagnostics
+    syncStack: seq[tuple[first, follow: SyncPredicate]]
     errLine*, errCol*: int ## where, `errCol` 0-based
     errMsg*: string        ## what
+
+  SyncPredicate* = proc (p: Parser): bool {.nimcall.}
+
+  ParseDiagnostic* = object
+    line*, col*: int
+    message*: string
 
 proc openParser*(src, filename: string; pool: Pool; tags: TagPool): Parser =
   ## `pool` and `tags` are the output's: nifler2 writes through `nifpools`'
@@ -119,7 +128,8 @@ proc openParser*(src, filename: string; pool: Pool; tags: TagPool): Parser =
                   currInd: 0, indStack: @[],
                   inPragma: 0, sections: @[], lastSection: VarL, wrapFields: @[],
                   pool: pool, tags: tags,
-                  failed: false, errLine: 0, errCol: 0, errMsg: "")
+                  failed: false, recovering: false, errors: @[], syncStack: @[],
+                  errLine: 0, errCol: 0, errMsg: "")
   next result.lex, result.tok
 
 proc close*(p: var Parser) =
@@ -136,6 +146,8 @@ proc finish*(p: var Parser): TokenBuf =
 
 proc info*(p: Parser): NifLineInfo {.inline.} =
   NifLineInfo(file: p.file, line: p.tok.line, col: p.tok.col)
+
+proc recoverError*(p: var Parser; line, col: int; msg: string)
 
 # --------------------------------------------------------------- diagnostics
 #
@@ -164,19 +176,14 @@ proc prettyTok*(t: Token): string =
   else: t.s
 
 proc errorAt*(p: var Parser; line, col: int; msg: string) =
-  ## The first syntax error ends the parse. Recovery would mean bailing out of
-  ## an arbitrarily deep recursion, and the generated code cannot: there are no
-  ## exceptions in this runtime and no notation for a recovery production. So
-  ## the error is recorded and the token stream ends *here*: from now on the
-  ## current token is an end of file that `getTok` never moves past. That is
-  ## what unwinds the recursion -- every repetition's continuation test fails
-  ## on it, and a mandatory item that does not match reports into an error
-  ## that is already recorded. It has to end the stream rather than merely
-  ## record the error, because `expect` does not consume the token it did not
-  ## match, so a repetition whose body fails would make no progress and spin.
-  ## A rule cut short leaves fewer trees than its layout expects, which is why
-  ## the layouts check `failed`.
-  if not p.failed:
+  ## Batch parsing remains fail-fast: EOF unwinds recursive descent and layout
+  ## helpers leave partial fixed-arity nodes alone. Editor parsing instead
+  ## records an error node and synchronizes with the active generated rule's
+  ## FIRST/FOLLOW predicates.
+  if p.recovering:
+    p.errors.add ParseDiagnostic(line: line, col: col, message: msg)
+    recoverError(p, line, col, msg)
+  elif not p.failed:
     p.failed = true
     p.errLine = line
     p.errCol = col
@@ -578,6 +585,49 @@ proc openNode(p: Parser): Mark {.inline.} =
 
 proc closeNode(p: var Parser; m: Mark; tag: NiflerKind; info: NifLineInfo) {.inline.} =
   wrapAt p, m, tag, info
+
+proc pushRecovery*(p: var Parser; first, follow: SyncPredicate) {.inline.} =
+  if p.recovering: p.syncStack.add (first, follow)
+
+proc popRecovery*(p: var Parser) {.inline.} =
+  if p.recovering and p.syncStack.len > 0: p.syncStack.setLen(p.syncStack.len - 1)
+
+proc isRecoveryPoint(p: Parser): bool {.inline.} =
+  if p.syncStack.len == 0: return p.tok.kind == tkEof
+  let sync = p.syncStack[^1]
+  sync.first(p) or sync.follow(p)
+
+proc sourceOffset(src: string; line, col: int): int =
+  result = 0
+  var currentLine = 1
+  while result < src.len and currentLine < line:
+    if src[result] == '\n': inc currentLine
+    inc result
+  result = min(src.len, result + max(0, col))
+
+proc recoverError*(p: var Parser; line, col: int; msg: string) =
+  ## Preserve skipped tokens as the origin subtree of an error node. The
+  ## active generated rule supplies its already-computed FIRST and FOLLOW
+  ## predicates; a FOLLOW token is left for the caller to consume.
+  let errMark = Mark(prev: p.last, info: NifLineInfo(file: p.file,
+    line: int32(line), col: int32(col)), sigs: p.sigs)
+  let rawMark = Mark(prev: p.last, info: errMark.info, sigs: p.sigs)
+  let rawStart = sourceOffset(p.lex.buf, int(p.tok.line), int(p.tok.col))
+  let atFollow = p.syncStack.len > 0 and p.syncStack[^1].follow(p)
+  if not atFollow and p.tok.kind != tkEof:
+    while p.tok.kind != tkEof:
+      getTok p
+      if p.isRecoveryPoint: break
+  let rawEnd = if p.tok.kind == tkEof: p.lex.buf.len
+               else: sourceOffset(p.lex.buf, int(p.tok.line), int(p.tok.col))
+  if rawEnd > rawStart:
+    let raw = p.lex.buf.substr(rawStart, rawEnd - 1)
+    p.append newNode(p, strLitToken(p.pool.strings.getOrIncl(raw)), rawMark.info)
+  else:
+    p.append newNode(p, dotToken(), NoLineInfo)
+  p.wrapAt rawMark, StmtsL, rawMark.info
+  p.append newNode(p, strLitToken(p.pool.strings.getOrIncl(msg)), errMark.info)
+  p.wrapAt errMark, ErrL, errMark.info
 
 proc insertLeafAt*(p: var Parser; m: Mark; text: string)
 
