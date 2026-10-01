@@ -25,7 +25,7 @@ type
     id*, parent*, indent*: int
 
   SemanticSymbol* = object
-    name*, kind*, uri*: string
+    name*, kind*, uri*, doc*: string
     range*: SourceRange
 
   SemanticSnapshot* = object
@@ -39,7 +39,8 @@ type
     text*: string
     nodes*: seq[SyntaxNode]
     scopes*: seq[ScopeNode]
-    diagnostics*: seq[ParseDiagnostic]
+    diagnostics*: seq[ParseDiagnostic]       ## from the recovering parser
+    semanticDiagnostics*: seq[ParseDiagnostic] ## from the compiler's sem pass
     nifTree*: string
     cacheFile*: string
     parsedFile*: string
@@ -204,6 +205,15 @@ proc indexSyntax(doc: var Document) =
     col += utf16Width(ch)
     inc i
 
+proc runDiagnostics*(db: var Database; doc: Document) {.raises.} =
+  ## Sem errors for the whole document, stored on it. A cursor query reports
+  ## them too, but the editor wants them on open and on change, not only once
+  ## the user points at something, and a query's own compile must not be the
+  ## only thing that ever fills the diagnostic list.
+  doc.queryLine = -1
+  doc.queryCharacter = -1
+  doc.semanticDiagnostics = semanticErrors(db.runCompiler(doc))
+
 proc updateDocument*(db: var Database; uri, path: string; version: int;
                      text: string): Document {.raises.} =
   var doc = Document(uri: uri, path: path, workspaceRoot: db.root,
@@ -251,6 +261,70 @@ proc closeDocument*(db: var Database; uri: string) {.raises.} =
 proc document*(db: Database; uri: string): Document {.raises.} =
   db.documents.getOrDefault(uri)
 
+proc unescapeTsv(s: string): string =
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    if s[i] == '\\' and i + 1 < s.len:
+      case s[i + 1]
+      of 't': result.add '\t'
+      of 'n': result.add '\n'
+      of 'r': result.add '\r'
+      else: result.add s[i + 1]
+      i += 2
+    else:
+      result.add s[i]
+      inc i
+
+proc moduleNameForPath*(db: Database; path: string): string =
+  moduleSuffix(path, db.modulePaths)
+
+proc runCompiler*(db: Database; doc: Document): string {.raises.} =
+  ## Run sem for `doc` and return its sidecar. Both the semantic query and the
+  ## diagnostics come out of this one invocation, so a query never costs a
+  ## second compile.
+  let compiler = db.compilerRoot / "bin" / "nimony"
+  let ideFile = db.cacheDir / (doc.moduleName & ".ide.tsv")
+  let semFile = db.cacheDir / (doc.moduleName & ".s.nif")
+  try:
+    if os.fileExists(semFile): removeFile(path(semFile))
+    if os.fileExists(ideFile): removeFile(path(ideFile))
+  except:
+    discard
+  var command = quoteShell(compiler) & " --base:" & quoteShell(db.root) &
+    " --nimcache:" & quoteShell(db.cacheDir)
+  for searchPath in db.modulePaths:
+    command.add " --path:" & quoteShell(searchPath)
+  command.add " check " & quoteShell(doc.parsedFile)
+  # The sidecar is written either way: with a cursor it carries the query,
+  # without one the errors alone. Line 0 is not a source line, so a
+  # cursor-less run collects diagnostics and matches no name.
+  var track = doc.path & ",0,0"
+  if doc.queryLine >= 0:
+    let offset = doc.positionOffset(doc.queryLine, doc.queryCharacter)
+    var lineStart = offset
+    while lineStart > 0 and doc.text[lineStart - 1] != '\n': dec lineStart
+    track = doc.path & "," & $(doc.queryLine + 1) & "," & $(offset - lineStart + 1)
+  command.add " --visible:" & quoteShell(track)
+  let _ = execCmdEx(command, workingDir = db.root)
+  if os.fileExists(ideFile): readFile(ideFile) else: ""
+
+proc semanticErrors*(content: string): seq[ParseDiagnostic] =
+  ## Undeclared identifiers and the other semantic errors, as the sidecar
+  ## records them.
+  result = @[]
+  for line in content.splitLines:
+    let fields = line.split('\t')
+    if fields.len >= 5 and fields[0] == "error":
+      var lineNo, column = 0
+      try:
+        lineNo = parseInt(fields[2]).int
+        column = parseInt(fields[3]).int
+      except:
+        continue
+      result.add ParseDiagnostic(line: lineNo, col: column,
+                                 message: unescapeTsv(fields[4]))
+
 proc nodeAt*(doc: Document; line, character: int): int =
   result = -1
   for n in doc.nodes:
@@ -288,6 +362,52 @@ proc resolve*(doc: Document; nodeId: int): seq[int] =
       result.setLen(0)
       nearestDepth = depth
     if depth == nearestDepth: result.add candidate.id
+
+proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
+                   name: string): string =
+  ## The `##` block directly above a declaration. NIF carries no comments --
+  ## the parser drops them -- so the text is read back from the source. The
+  ## scan stops at the first line that is not a doc comment, which is what makes
+  ## this the comment for THIS declaration and not one further up.
+  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  var text = ""
+  if path == doc.path: text = doc.text
+  else:
+    try: text = readFile(path)
+    except: discard
+  if text.len == 0: return ""
+  var lines: seq[string] = @[]
+  var start = 0
+  var current = 1
+  while current < lineNo and start < text.len:
+    if text[start] == '\n': inc current
+    inc start
+  var stop = start
+  while stop < text.len and text[stop] != '\n': inc stop
+  var scan = start
+  var collected: seq[string] = @[]
+  while scan > 0:
+    dec scan
+    if text[scan] == '\n': continue
+    var lineEnd = scan + 1
+    while lineEnd < text.len and text[lineEnd] != '\n': inc lineEnd
+    var lineStart = lineEnd
+    while lineStart > 0 and text[lineStart - 1] != '\n': dec lineStart
+    var firstNonSpace = lineStart
+    while firstNonSpace < lineEnd and text[firstNonSpace] in {' ', '\t'}:
+      inc firstNonSpace
+    if firstNonSpace + 1 < lineEnd and text[firstNonSpace] == '#' and
+        text[firstNonSpace + 1] == '#':
+      var body = text[firstNonSpace + 2 ..< lineEnd]
+      if body.len > 0 and body[0] == ' ': body = body[1 .. ^1]
+      collected.add body
+      scan = lineStart
+    else:
+      break
+  if collected.len == 0: return ""
+  for i in countdown(collected.high, 0):
+    lines.add collected[i]
+  lines.join("\n")
 
 proc positionOffset(doc: Document; line, character: int): int =
   result = 0
@@ -387,12 +507,15 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
         for id in doc.resolveNameAt(fields[1], queryLine, queryCharacter):
           let n = doc.nodes[id]
           let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
-            uri: doc.uri, range: n.range)
+            uri: doc.uri, range: n.range,
+            doc: doc.docCommentAt(doc.path, n.range.startLine + 1,
+                                  n.range.startCharacter, n.text))
           if fields[0] == "visible": result.visible.add symbol
           else: result.candidates.add symbol
       elif source.len > 0:
         let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
           uri: doc.uriForPath(source),
+          doc: doc.docCommentAt(source, lineNo, column, fields[1]),
           range: doc.sourceRange(source, lineNo, column, fields[1]))
         if fields[0] == "visible": result.visible.add symbol
         else: result.candidates.add symbol
@@ -407,26 +530,10 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSna
     return doc.queryResult
   result = SemanticSnapshot(queried: true, matched: false,
                             visible: @[], candidates: @[])
-  let offset = doc.positionOffset(line, character)
-  var lineStart = offset
-  while lineStart > 0 and doc.text[lineStart - 1] != '\n': dec lineStart
-  let compiler = db.compilerRoot / "bin" / "nimony"
-  let semFile = db.cacheDir / (doc.moduleName & ".s.nif")
-  let ideFile = db.cacheDir / (doc.moduleName & ".ide.tsv")
-  try:
-    if os.fileExists(semFile): removeFile(path(semFile))
-    if os.fileExists(ideFile): removeFile(path(ideFile))
-  except:
-    discard
-  let track = doc.path & "," & $(line + 1) & "," & $(offset - lineStart + 1)
-  var command = quoteShell(compiler) & " --base:" & quoteShell(db.root) &
-    " --nimcache:" & quoteShell(db.cacheDir)
-  for searchPath in db.modulePaths:
-    command.add " --path:" & quoteShell(searchPath)
-  command.add " check " & quoteShell(doc.parsedFile) &
-    " --visible:" & quoteShell(track)
-  let _ = execCmdEx(command, workingDir = db.root)
-  if os.fileExists(ideFile): result = parseIdeSnapshot(doc, readFile(ideFile), line, character)
+  doc.queryLine = line
+  doc.queryCharacter = character
+  let content = db.runCompiler(doc)
+  if content.len > 0: result = parseIdeSnapshot(doc, content, line, character)
   doc.queryCached = true
   doc.queryLine = line
   doc.queryCharacter = character

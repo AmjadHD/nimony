@@ -4,6 +4,7 @@
 {.feature: "lenientnils".}
 
 import std / [json, strutils, uri, sets]
+import ../nifler2 / parserrt
 import database
 
 type HandlerResult* = object
@@ -58,16 +59,27 @@ proc rangeJson(r: SourceRange): string =
   "{\"start\":" & posJson(r.startLine, r.startCharacter) &
     ",\"end\":" & posJson(r.endLine, r.endCharacter) & "}"
 
+proc diagnosticJson(d: ParseDiagnostic; severity: int; source: string): string =
+  let line = max(0, d.line - 1)
+  let col = max(0, d.col)
+  "{\"range\":{\"start\":" & posJson(line, col) &
+    ",\"end\":" & posJson(line, col + 1) &
+    "},\"severity\":" & $severity & ",\"source\":\"" & source &
+    "\",\"message\":" & quoteJson(d.message) & "}"
+
 proc diagnosticsJson(doc: Document): string =
+  ## Parser and sem diagnostics together. Both refer to positions in this
+  ## document's text, so the editor underlines both in one pass.
   result = "["
-  for i, d in doc.diagnostics:
-    if i > 0: result.add ','
-    let line = max(0, d.line - 1)
-    let col = max(0, d.col)
-    result.add "{\"range\":{\"start\":" & posJson(line, col) &
-      ",\"end\":" & posJson(line, col + 1) &
-      "},\"severity\":1,\"source\":\"nimony\",\"message\":" &
-      quoteJson(d.message) & "}"
+  var first = true
+  for d in doc.diagnostics:
+    if not first: result.add ','
+    first = false
+    result.add diagnosticJson(d, 1, "nimony")
+  for d in doc.semanticDiagnostics:
+    if not first: result.add ','
+    first = false
+    result.add diagnosticJson(d, 1, "nimony")
   result.add ']'
 
 proc uriPath(uriText: string): string {.raises.} =
@@ -85,10 +97,11 @@ proc docPosition(params: JsonNode): tuple[line, character: int] =
 
 proc definitionJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   result = "["
-  if query.queried:
+  # Prefer the compiler's choice, fall back to lexical resolution when it
+  # matched nothing.
+  if query.matched:
     var first = true
-    if query.matched:
-      for symbol in query.candidates:
+    for symbol in query.candidates:
         if symbol.uri.len == 0: continue
         if not first: result.add ','
         first = false
@@ -104,18 +117,34 @@ proc definitionJson(doc: Document; nodeId: int; query: SemanticSnapshot): string
   result.add ']'
 
 proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
-  if query.queried:
-    if query.candidates.len == 0: return "null"
+  ## Signature line, then the declaration's doc comment when there is one.
+  ## Editors show the markdown as a popup, so the doc text goes in as plain
+  ## markdown below the code span.
+  # A query that matched nothing (the cursor is on a declaration, or sem did
+  # not run) still deserves the lexical answer rather than nothing at all.
+  if query.candidates.len > 0:
     let symbol = query.candidates[0]
-    return "{\"contents\":{\"kind\":\"markdown\",\"value\":" &
-      quoteJson("`" & symbol.kind & " " & symbol.name & "`") &
+    var value = "`" & symbol.kind & " " & symbol.name & "`"
+    if symbol.doc.len > 0:
+      if symbol.doc.contains("\n"):
+        value.add "\n\n```nim\n" & symbol.doc & "\n```"
+      else:
+        value.add "\n\n" & symbol.doc
+    return "{\"contents\":{\"kind\":\"markdown\",\"value\":" & quoteJson(value) &
       "},\"range\":" & rangeJson(symbol.range) & "}"
   let resolved = doc.resolve(nodeId)
   if resolved.len == 0: return "null"
-  let n = doc.nodes[resolved[0]]
-  let kindName = if n.declarationKind.len > 0: n.declarationKind else: "symbol"
-  "{\"contents\":{\"kind\":\"markdown\",\"value\":" &
-    quoteJson("`" & kindName & " " & n.text & "`") &
+  let decl = doc.nodes[resolved[0]]
+  let kindName = if decl.declarationKind.len > 0: decl.declarationKind else: "symbol"
+  var value = "`" & kindName & " " & decl.text & "`"
+  let docs = doc.docCommentAt(doc.path, decl.range.startLine + 1,
+                             decl.range.startCharacter, decl.text)
+  if docs.len > 0:
+    if docs.contains("\n"):
+      value.add "\n\n```nim\n" & docs & "\n```"
+    else:
+      value.add "\n\n" & docs
+  "{\"contents\":{\"kind\":\"markdown\",\"value\":" & quoteJson(value) &
     "},\"range\":" & rangeJson(doc.nodes[nodeId].range) & "}"
 
 proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot): string =
@@ -180,6 +209,7 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
           for change in items(changes): source = getStr(field(change, "text"))
     let version = int(getInt(field(td, "version")))
     let doc = db.updateDocument(uriText, uriPath(uriText), version, source)
+    db.runDiagnostics(doc)
     result.notification = publishDiagnostics(doc)
   of "textDocument/didClose":
     let uriText = getStr(field(field(params, "textDocument"), "uri"))

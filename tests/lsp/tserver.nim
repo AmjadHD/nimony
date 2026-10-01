@@ -3,6 +3,15 @@ import ../../src/lsp/[database, handlers]
 
 proc runTests() {.raises.} =
   var db = initDatabase(getCurrentDir())
+  let docUri = "file:///workspace/lsp-docs.nim"
+  let openedDocs = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim","languageId":"nim","version":1,"text":"## Doubles x.\n##\n## Second line.\nproc double*(x: int): int =\n  x * 2\n\nproc use() =\n  discard double(2)\n"}}}""")
+  let docsHover = handle(db, """{"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim"},"position":{"line":7,"character":12}}}""")
+  assert docsHover.response.contains("proc double")
+  assert docsHover.response.contains("Doubles x.")
+  assert docsHover.response.contains("Second line.")
+  discard openedDocs
+  discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim"}}}""")
+
   let uri = "file:///workspace/lsp-test.nim"
   let opened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim","version":1,"text":"let broken = (1\nlet typedBroken: UnknownType = 1\nimport std/strutils\nlet global = 1\nproc f() =\n  let global = 2\n  let local = global\n  let found = contains(\"x\", \"x\")\n  local\n  global.\n  \n"}}}""")
   assert opened.notification.contains("publishDiagnostics")
@@ -34,6 +43,10 @@ proc runTests() {.raises.} =
   let completion = handle(db, """{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":10,"character":2}}}""")
   assert completion.response.contains("\"label\":\"local\"")
   assert completion.response.contains("\"label\":\"global\"")
+
+  # A semantic error reaches the editor even though nothing points at it.
+  assert opened.notification.contains("undeclared identifier") or
+         opened.notification.contains("UnknownType")
 
   let cacheFile = db.document(uri).cacheFile
   assert cacheFile.contains("nimcache/lsp")

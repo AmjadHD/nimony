@@ -17,11 +17,19 @@ type
     Trace = "Trace: "
     Debug = "Debug: "
 
+  ErrorRecord* = object
+    ## One reported error, kept in structured form so a consumer that cannot
+    ## read stdout (the LSP) still learns where and what.
+    info*: NifLineInfo
+    msg*: string
+
   Reporter* = object
     verbosity*: int
     noColors*: bool
     warnings*: int
     errors*: int
+    quiet*: bool ## collect into `collected` instead of printing
+    collected*: seq[ErrorRecord]
     reportedErrSources: HashSet[NifLineInfo]
 
 
@@ -146,7 +154,12 @@ proc reportErrorsRec(r: var Reporter; n: var Cursor; errTag: TagId; count: var i
           # itself erroneous. Printing again would just stack noise on top.
           if n.isStringLit:
             if doReport and pool.strings[n.strId].len > 0:
-              r.error infoToStr(info), pool.strings[n.strId]
+              let msg = pool.strings[n.strId]
+              if r.quiet:
+                r.collected.add ErrorRecord(info: info, msg: msg)
+                inc r.errors
+              else:
+                r.error infoToStr(info), msg
             inc n
           if not cursorIsNil(payload):
             reportErrorsRec(r, payload, errTag, count)
@@ -165,3 +178,16 @@ proc reportErrors*(dest: var TokenBuf): int =
   var n = beginRead(dest)
   reportErrorsRec(r, n, errTag, result)
   endRead(n)
+
+proc collectErrors*(dest: var TokenBuf): seq[ErrorRecord] =
+  ## Same walk as `reportErrors`, but the errors are returned instead of
+  ## printed. An editor needs them as data; the count and the source dedup are
+  ## the same, so this and `reportErrors` never disagree about which `(err …)`
+  ## nodes are diagnostic.
+  let errTag = globalTags.registerTag("err")
+  var r = Reporter(verbosity: 0, noColors: true, quiet: true)
+  var count = 0
+  var n = beginRead(dest)
+  reportErrorsRec(r, n, errTag, count)
+  endRead(n)
+  r.collected

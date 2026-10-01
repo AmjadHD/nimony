@@ -224,7 +224,16 @@ proc semToplevelStmts(c: var SemContext; dest: var TokenBuf; buf: var TokenBuf) 
     while n.hasMore:
       semStmt c, dest, n, false
 
-proc writeIdeQuery(c: SemContext) =
+proc escapeTsv(s: string): string =
+  ## One record per line, one field per column.
+  for ch in s:
+    case ch
+    of '\t': result.add "\\t"
+    of '\n': result.add "\\n"
+    of '\r': result.add "\\r"
+    else: result.add ch
+
+proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
   var output = "matched\t" & $c.ideQuery.matched & "\n"
   for symbol in c.ideQuery.visible:
     let file = if symbol.info.file.isValid: pool.filenames[symbol.info.file] else: ""
@@ -238,6 +247,12 @@ proc writeIdeQuery(c: SemContext) =
       "\t" & file & "\t" & $symbol.info.line &
       "\t" & $symbol.info.col & "\t" &
       $(pool.symModule(symbol.id) == c.thisModuleSuffix) & "\n"
+  # An editor shows these as diagnostics, and it cannot read the reporter's
+  # stdout: they travel in the same sidecar as the query.
+  for record in reporters.collectErrors(dest):
+    let file = if record.info.isValid: pool.filenames[record.info.file] else: ""
+    output.add "error\t" & escapeTsv(file) & "\t" & $record.info.line & "\t" &
+      $record.info.col & "\t" & escapeTsv(record.msg) & "\n"
   let path = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".ide.tsv"
   onRaiseQuit writeFile(path, output)
 
@@ -272,6 +287,8 @@ proc phase3(c: var SemContext; buf: var TokenBuf; moduleLineInfo: NifLineInfo): 
 
 proc enableIdeQuery(c: var SemContext; source: string) =
   let track = c.g.config.toTrack
+  # Line 0 asks for the sidecar without a query: the editor wants the errors
+  # of a whole document, and no real line is 0, so nothing matches a name.
   if track.mode == TrackVisible and realFile(track.filename) == realFile(source):
     c.ideQuery = IdeQuery(enabled: true,
       info: NifLineInfo(file: pool.filenames.getOrIncl(track.filename),
@@ -557,7 +574,7 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   # tree and return the query snapshot instead of making an editor parse fatal.
   if c.ideQuery.enabled:
     dest.addParRi()
-    writeIdeQuery c
+    writeIdeQuery c, dest
     let outfile = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".s.nif"
     writeOutput c, dest, outfile
     return
@@ -769,7 +786,7 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
   for i in 0..<modules.len:
     if modules[i].c.ideQuery.enabled:
       modules[i].dest.addParRi()
-      writeIdeQuery modules[i].c
+      writeIdeQuery modules[i].c, modules[i].dest
       writeOutput modules[i].c, modules[i].dest, modules[i].outfile
     else:
       semcheckPostProcess modules[i].c, modules[i].dest
