@@ -104,8 +104,21 @@ proc diagnosticsJson(doc: Document): string =
   result.add ']'
 
 proc uriPath(uriText: string): string {.raises.} =
-  if uriText.startsWith("file://"): decodeUrl(uriText[7 .. ^1])
-  else: uriText
+  ## The inverse of `uriForPath`. `file://` is followed by an empty authority
+  ## and then the path, so three slashes mean one leading slash in the path --
+  ## except for a drive letter, where `/C:/x` is the conventional spelling and
+  ## the extra slash is not part of the filename.
+  if not uriText.startsWith("file://"): return uriText
+  var rest = uriText[7 .. ^1]
+  # A non-empty authority (`file://host/share`) is not a local path; leave it.
+  if rest.len > 0 and rest[0] != '/': return decodeUrl(rest)
+  rest = decodeUrl(rest)
+  # `/C:/x` is how a drive letter is spelled in a URI; the slash is not part of
+  # the filename.
+  if rest.len >= 3 and rest[0] == '/' and rest[1] in {'a'..'z', 'A'..'Z'} and
+      rest[2] == ':':
+    return rest[1 .. ^1]
+  rest
 
 proc publishDiagnostics(doc: Document): string =
   "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{" &

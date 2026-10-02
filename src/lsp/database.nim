@@ -497,10 +497,30 @@ proc sourceRange(doc: Document; source: string; line, col: int;
   SourceRange(startLine: lineNo, startCharacter: column,
               endLine: lineNo, endCharacter: column + width)
 
-proc uriForPath(doc: Document; source: string): string =
+proc toUriSeparators(path: string): string =
+  ## A URI path uses `/` everywhere. NIF filenames come from the compiler and
+  ## may carry `\` on Windows, and `os.isAbsolute` answers for the HOST's rules,
+  ## so a foreign absolute path has to be recognized here rather than grafted
+  ## onto the workspace root. A leading UNC `\\` becomes `//`.
+  result = path.replace('\\', '/')
+  if result.len >= 2 and result[1] == ':':
+    # A drive-qualified path is absolute whatever the host thinks.
+    return result
+  if result.len >= 2 and result[0] == '/' and result[1] == '/':
+    return result
+  if result.len > 0 and result[0] == '/': return result
+  ""
+
+proc uriForPath*(doc: Document; source: string): string =
+  ## Exported for the URI round-trip tests.
   if source == doc.path: return doc.uri
-  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  var path = toUriSeparators(source)
+  if path.len == 0:
+    path = toUriSeparators(doc.workspaceRoot / source)
   result = "file://"
+  if path.len == 0 or path[0] != '/':
+    # Keep the `file://` scheme from swallowing the first segment as a host.
+    result.add '/'
   const Hex = "0123456789ABCDEF"
   for c in path:
     if c in {'a'..'z', 'A'..'Z', '0'..'9', '-', '_', '.', '~', '/', ':'}:

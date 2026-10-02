@@ -1,8 +1,54 @@
-import std / [assertions, os, strutils]
+import std / [assertions, os, strutils, uri]
 import ../../src/lsp/[database, handlers]
+
+proc uriPathForTest(uriText: string): string {.raises.} =
+  ## The handler's decode step, so the test exercises the real round trip.
+  if not uriText.startsWith("file://"): return uriText
+  var rest = uriText[7 .. ^1]
+  if rest.len > 0 and rest[0] != '/': return decodeUrl(rest)
+  rest = decodeUrl(rest)
+  if rest.len >= 3 and rest[0] == '/' and rest[1] in {'a'..'z', 'A'..'Z'} and
+      rest[2] == ':':
+    return rest[1 .. ^1]
+  rest
 
 proc runTests() {.raises.} =
   var db = initDatabase(getCurrentDir())
+
+  # A definition into another module hands the client a URI. It has to be one
+  # the client can open, so separators are normalized and reserved characters
+  # are percent-encoded -- and encoding must not depend on what the HOST thinks
+  # is absolute, or a Windows path gets grafted onto the workspace root.
+  let uriDoc = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/plain.nim","version":1,"text":"let x = 1\n"}}}""")
+  discard uriDoc
+  let plain = db.document("file:///workspace/plain.nim")
+  let cases = [
+    ("C:/Users/x/a.nim", "file:///C:/Users/x/a.nim"),
+    ("C:\\Users\\x\\a.nim", "file:///C:/Users/x/a.nim"),
+    ("\\\\server\\share\\a.nim", "file:////server/share/a.nim"),
+    ("/abs/with space/x.nim", "file:///abs/with%20space/x.nim"),
+    ("/abs/hash#f.nim", "file:///abs/hash%23f.nim"),
+    ("/abs/percent%20/x.nim", "file:///abs/percent%2520/x.nim"),
+    ("lib/std/strutils.nim", "file://" & getCurrentDir() & "/lib/std/strutils.nim")]
+  for id in 0 ..< cases.len:
+    let uri = plain.uriForPath(cases[id][0])
+    assert uri == cases[id][1], "encode " & cases[id][0] & " -> " & uri
+    # A relative path resolves against the workspace root, so what comes back
+    # is the absolute form -- that is the point of resolving it.
+    var want = cases[id][0].replace('\\', '/')
+    if not want.isAbsolute and want[1] != ':': want = getCurrentDir() / want
+    assert uriPathForTest(uri) == want, "round trip " & uri
+  # Incoming URIs decode to a usable path, drive letter included.
+  let incoming = [("file:///workspace/plain.nim", "/workspace/plain.nim"),
+                  ("file:///C:/Users/x/a.nim", "C:/Users/x/a.nim"),
+                  ("file:///c%3A/Users/x/a.nim", "c:/Users/x/a.nim"),
+                  ("file:///workspace/with%20space/a.nim", "/workspace/with space/a.nim"),
+                  ("file:///workspace/back%5Cslash/a.nim", "/workspace/back\\slash/a.nim")]
+  for id in 0 ..< incoming.len:
+    let decoded = uriPathForTest(incoming[id][0])
+    assert decoded == incoming[id][1], "decode " & incoming[id][0] & " -> " & decoded
+  discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/plain.nim"}}}""")
+
   # A peer that sends nonsense gets silence, never a dead server: every
   # accessor runs against whatever the peer actually sent.
   for bad in ["", "garbage", "[]", """{"method":123}""",
