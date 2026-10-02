@@ -16,6 +16,38 @@ existing incremental build graph does not provide node-granular semantic
 invalidation. LSP parser, dependency, and semantic artifacts live only below
 `nimcache/lsp/`; batch compilation never reads them.
 
+## Known limitation: one compiler process per query
+
+Queries shell out. Every hover, definition or completion request spawns
+`nimony check`, which re-resolves the document and its whole import graph. The
+cache holds exactly one `(line, character)`, so only an *immediately* repeated
+position is free: moving away and back costs another process. Measured over
+stdio on a document importing five stdlib modules (Termux, 8 cores):
+
+| operation | cost |
+| --- | --- |
+| first query, empty `nimcache/lsp/` | ~2.4 s |
+| query at a cursor position not cached | ~100 ms |
+| query repeated at the cached position | ~0 ms |
+
+The ~100 ms is the build graph reusing already-parsed and already-semmed
+`.s.nif` artifacts for the imports; it is not a cheap query. Moving the cursor
+one line re-resolves the document's own scopes from zero, and a larger import
+graph makes the cold case worse. An editor that re-queries on every keystroke
+and mouse move will feel this.
+
+This is a bridge transport, not a steady-state design. It exists because it
+proves the `--visible` flag and the TSV wire format are semantically correct.
+Replacing it means keeping a warm `SemContext` per open document inside the
+server process and re-running only on text change, which needs an audit of what
+`nimsem` assumes is single-process, short-lived global state (symbol pools,
+interning tables), in the same spirit as the parallel-compiler audit. Until that
+lands, per-query process spawn is the expected price of a semantic answer.
+
+`tests/lsp/queries.nim` exercises this path. Note that the in-process timings it
+prints are not trustworthy on every platform — `getMonoTime` does not advance
+reliably here — so measure latency from outside the process.
+
 Parser recovery is a safe in-place extension because it preserves the grammar's
 ordinary FIRST/FOLLOW analysis and emits balanced `(err ...)` nodes only when
 the parser is explicitly placed in recovery mode. Batch parsing keeps its

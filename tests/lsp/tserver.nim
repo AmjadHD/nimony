@@ -3,6 +3,17 @@ import ../../src/lsp/[database, handlers]
 
 proc runTests() {.raises.} =
   var db = initDatabase(getCurrentDir())
+  # A peer that sends nonsense gets silence, never a dead server: every
+  # accessor runs against whatever the peer actually sent.
+  for bad in ["", "garbage", "[]", """{"method":123}""",
+              """{"method":"textDocument/didOpen"}""",
+              """{"method":"textDocument/didChange"}""",
+              """{"method":"textDocument/hover","params":5}""",
+              """{"method":"textDocument/definition","params":{"textDocument":{},"position":{}}}""",
+              """{"method":"textDocument/completion","params":{"textDocument":null}}""",
+              """{"method":"textDocument/didClose"}"""]:
+    discard handle(db, bad)
+
   let docUri = "file:///workspace/lsp-docs.nim"
   let openedDocs = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim","languageId":"nim","version":1,"text":"## Doubles x.\n##\n## Second line.\nproc double*(x: int): int =\n  x * 2\n\nproc use() =\n  discard double(2)\n"}}}""")
   let docsHover = handle(db, """{"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim"},"position":{"line":7,"character":12}}}""")

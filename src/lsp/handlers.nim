@@ -30,26 +30,47 @@ proc quoteJson(s: string): string =
         result.add c
   result.add '"'
 
+proc isEmpty(node: JsonNode): bool {.inline.} =
+  ## A missing `params` is a default-constructed JsonNode, and `kind` on it
+  ## dereferences a nil cursor. Every accessor here is reachable with whatever
+  ## the peer sent, so the check comes before any read.
+  cursorIsNil(node.c)
+
 proc field(node: JsonNode; name: string): JsonNode =
-  if kind(node) != JObject: return JsonNode()
+  if node.isEmpty or kind(node) != JObject: return JsonNode()
   for key, value in pairs(node):
     if key == name: return value
   result = JsonNode()
 
 proc hasField(node: JsonNode; name: string): bool =
-  if kind(node) != JObject: return false
+  if node.isEmpty or kind(node) != JObject: return false
   for key, value in pairs(node):
     if key == name: return true
   result = false
 
-proc stringField(node: JsonNode; name: string): string =
-  if node.hasField(name): getStr(field(node, name))
+proc strField(node: JsonNode; name: string): string =
+  ## A missing field and a field of the wrong type are both simply no value:
+  ## `getStr` on a wrong-kind node is a crash, not an error.
+  let value = node.field(name)
+  if value.isEmpty: return ""
+  if kind(value) == JString: value.getStr
+  elif kind(value) == JInt: $value.getInt
   else: ""
+
+proc intField(node: JsonNode; name: string): int64 =
+  let value = node.field(name)
+  if value.isEmpty: return 0
+  if kind(value) == JInt: value.getInt
+  elif kind(value) == JFloat: value.getFloat.int64
+  else: 0
+
+proc stringField(node: JsonNode; name: string): string =
+  node.strField(name)
 
 proc rpcId(node: JsonNode): string =
   case kind(node)
-  of JInt: $getInt(node)
-  of JString: quoteJson(getStr(node))
+  of JInt: $node.getInt
+  of JString: quoteJson(node.getStr)
   else: "null"
 
 proc posJson(line, character: int): string =
@@ -93,7 +114,7 @@ proc publishDiagnostics(doc: Document): string =
 
 proc docPosition(params: JsonNode): tuple[line, character: int] =
   let pos = field(params, "position")
-  (int(getInt(field(pos, "line"))), int(getInt(field(pos, "character"))))
+  (int(pos.intField("line")), int(pos.intField("character")))
 
 proc definitionJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   result = "["
@@ -180,7 +201,10 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
   result = HandlerResult(response: "", notification: "", stop: false)
   var parsed = parseJson(body)
   let msg = parsed.root
-  let methodName = getStr(field(msg, "method"))
+  # A malformed message must not take the server down with it: an editor that
+  # sends garbage gets silence, not a crash.
+  if msg.isEmpty or kind(msg) != JObject: return
+  let methodName = msg.strField("method")
   let params = field(msg, "params")
   let idNode = field(msg, "id")
   let idPresent = hasField(msg, "id")
@@ -200,25 +224,28 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
       "\"serverInfo\":{\"name\":\"nimony-lsp\",\"version\":\"0.1\"}}}"
   of "textDocument/didOpen", "textDocument/didChange":
     let td = field(params, "textDocument")
-    let uriText = getStr(field(td, "uri"))
-    var source = stringField(td, "text")
+    let uriText = td.strField("uri")
+    # No URI means no path, and the compiler would be handed an empty file to
+    # resolve: reject it here rather than pay for a run that cannot succeed.
+    if uriText.len == 0: return
+    var source = td.strField("text")
     if methodName == "textDocument/didChange":
       if hasField(params, "contentChanges"):
         let changes = field(params, "contentChanges")
         if kind(changes) == JArray:
-          for change in items(changes): source = getStr(field(change, "text"))
-    let version = int(getInt(field(td, "version")))
+          for change in items(changes): source = change.strField("text")
+    let version = int(td.intField("version"))
     let doc = db.updateDocument(uriText, uriPath(uriText), version, source)
     db.runDiagnostics(doc)
     result.notification = publishDiagnostics(doc)
   of "textDocument/didClose":
-    let uriText = getStr(field(field(params, "textDocument"), "uri"))
+    let uriText = field(params, "textDocument").strField("uri")
     db.closeDocument(uriText)
     result.notification = "{\"jsonrpc\":\"2.0\",\"method\":" &
       "\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" &
       quoteJson(uriText) & ",\"diagnostics\":[]}}"
   of "textDocument/completion", "textDocument/hover", "textDocument/definition":
-    let uriText = getStr(field(field(params, "textDocument"), "uri"))
+    let uriText = field(params, "textDocument").strField("uri")
     let doc = db.document(uriText)
     var value = "null"
     if doc != nil:
