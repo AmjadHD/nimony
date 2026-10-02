@@ -226,6 +226,7 @@ proc semToplevelStmts(c: var SemContext; dest: var TokenBuf; buf: var TokenBuf) 
 
 proc escapeTsv(s: string): string =
   ## One record per line, one field per column.
+  result = newStringOfCap(s.len)
   for ch in s:
     case ch
     of '\t': result.add "\\t"
@@ -235,6 +236,31 @@ proc escapeTsv(s: string): string =
 
 proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
   var output = "matched\t" & $c.ideQuery.matched & "\n"
+  if c.ideQuery.documentMode:
+    # One row per identifier occurrence, then one per import. The editor builds
+    # a position index from this and answers any cursor position without
+    # running the compiler again.
+    for position in c.ideQuery.positions:
+      output.add "position\t" & $position.info.line & "\t" & $position.info.col &
+        "\t" & escapeTsv(pool.strings[position.name]) & "\t" &
+        $position.candidates.len & "\n"
+      for symbol in position.candidates:
+        let file = if symbol.info.isValid: pool.filenames[symbol.info.file] else: ""
+        output.add "candidate\t" & pool.symBasename(symbol.id) & "\t" & $symbol.kind &
+          "\t" & file & "\t" & $symbol.info.line & "\t" & $symbol.info.col & "\t" &
+          $(pool.symModule(symbol.id) == c.thisModuleSuffix) & "\n"
+    for symbol in c.ideQuery.imports:
+      let file = if symbol.info.isValid: pool.filenames[symbol.info.file] else: ""
+      output.add "import\t" & pool.symBasename(symbol.id) & "\t" & $symbol.kind &
+        "\t" & file & "\t" & $symbol.info.line & "\t" & $symbol.info.col &
+        "\t" & $(pool.symModule(symbol.id) == c.thisModuleSuffix) & "\n"
+    let path = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".ide.tsv"
+    for record in reporters.collectErrors(dest):
+      let file = if record.info.isValid: pool.filenames[record.info.file] else: ""
+      output.add "error\t" & escapeTsv(file) & "\t" & $record.info.line & "\t" &
+        $record.info.col & "\t" & escapeTsv(record.msg) & "\n"
+    onRaiseQuit writeFile(path, output)
+    return
   for symbol in c.ideQuery.visible:
     let file = if symbol.info.file.isValid: pool.filenames[symbol.info.file] else: ""
     output.add "visible\t" & pool.symBasename(symbol.id) & "\t" & $symbol.kind &
@@ -287,10 +313,12 @@ proc phase3(c: var SemContext; buf: var TokenBuf; moduleLineInfo: NifLineInfo): 
 
 proc enableIdeQuery(c: var SemContext; source: string) =
   let track = c.g.config.toTrack
-  # Line 0 asks for the sidecar without a query: the editor wants the errors
-  # of a whole document, and no real line is 0, so nothing matches a name.
+  # Line 0 asks for the whole document: every identifier occurrence, the import
+  # table and the errors, in one pass. That is what lets an editor answer any
+  # cursor position from a single compile. No real line is 0, so the
+  # cursor-specific path cannot be reached from document mode.
   if track.mode == TrackVisible and realFile(track.filename) == realFile(source):
-    c.ideQuery = IdeQuery(enabled: true,
+    c.ideQuery = IdeQuery(enabled: true, documentMode: track.line == 0,
       info: NifLineInfo(file: pool.filenames.getOrIncl(track.filename),
                         line: track.line, col: track.col),
       name: StrId(0), visible: @[], candidates: @[])
@@ -574,6 +602,7 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   # tree and return the query snapshot instead of making an editor parse fatal.
   if c.ideQuery.enabled:
     dest.addParRi()
+    c.captureIdeImports(dest)
     writeIdeQuery c, dest
     let outfile = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".s.nif"
     writeOutput c, dest, outfile
@@ -786,6 +815,7 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
   for i in 0..<modules.len:
     if modules[i].c.ideQuery.enabled:
       modules[i].dest.addParRi()
+      modules[i].c.captureIdeImports(modules[i].dest)
       writeIdeQuery modules[i].c, modules[i].dest
       writeOutput modules[i].c, modules[i].dest, modules[i].outfile
     else:

@@ -28,9 +28,17 @@ type
     name*, kind*, uri*, doc*: string
     range*: SourceRange
 
+  IdePosition* = object
+    ## One identifier occurrence and what it resolved to, from document mode.
+    ## The editor indexes these by position so no query needs a new compile.
+    line*, column*: int
+    name*: string
+    symbols*: seq[SemanticSymbol]
+
   SemanticSnapshot* = object
-    queried*, matched*: bool
-    visible*, candidates*: seq[SemanticSymbol]
+    queried*, matched*, documentMode*: bool
+    visible*, candidates*, imports*: seq[SemanticSymbol]
+    positions*: seq[IdePosition]
 
   Document* = ref object
     uri*, path*: string
@@ -41,6 +49,7 @@ type
     scopes*: seq[ScopeNode]
     diagnostics*: seq[ParseDiagnostic]       ## from the recovering parser
     semanticDiagnostics*: seq[ParseDiagnostic] ## from the compiler's sem pass
+    snapshot*: SemanticSnapshot  ## every identifier occurrence, from one check
     nifTree*: string
     cacheFile*: string
     parsedFile*: string
@@ -206,13 +215,15 @@ proc indexSyntax(doc: var Document) =
     inc i
 
 proc runDiagnostics*(db: var Database; doc: Document) {.raises.} =
-  ## Sem errors for the whole document, stored on it. A cursor query reports
-  ## them too, but the editor wants them on open and on change, not only once
-  ## the user points at something, and a query's own compile must not be the
-  ## only thing that ever fills the diagnostic list.
+  ## One check per document version, in document mode: every identifier
+  ## occurrence, the import table and the errors together. Queries then read
+  ## this instead of compiling again, so the cost lands on the edit rather than
+  ## on every cursor move.
   doc.queryLine = -1
   doc.queryCharacter = -1
-  doc.semanticDiagnostics = semanticErrors(db.runCompiler(doc))
+  let content = db.runCompiler(doc)
+  doc.snapshot = parseIdeSnapshot(doc, content, -1, -1)
+  doc.semanticDiagnostics = semanticErrors(content)
 
 proc updateDocument*(db: var Database; uri, path: string; version: int;
                      text: string): Document {.raises.} =
@@ -260,6 +271,21 @@ proc closeDocument*(db: var Database; uri: string) {.raises.} =
 
 proc document*(db: Database; uri: string): Document {.raises.} =
   db.documents.getOrDefault(uri)
+
+proc positionAt*(snapshot: SemanticSnapshot; line, character: int): IdePosition {.raises.} =
+  ## The occurrence the cursor is inside, if any. An identifier can be several
+  ## columns wide, so the match is by span and not by the exact start column.
+  result = IdePosition(line: -1, column: -1)
+  var best = high(int)
+  for position in snapshot.positions:
+    if position.line != line + 1: continue
+    let width = position.name.len
+    if character < position.column or character >= position.column + width: continue
+    let distance = character - position.column
+    if distance < best:
+      best = distance
+      result = position
+  result
 
 proc unescapeTsv(s: string): string =
   result = newStringOfCap(s.len)
@@ -486,15 +512,57 @@ proc uriForPath(doc: Document; source: string): string =
 
 proc resolveNameAt(doc: Document; name: string; line, character: int): seq[int]
 
+proc symbolFromFields(doc: Document; fields: seq[string]): SemanticSymbol {.raises.} =
+  ## `candidate` and `import` rows share a shape: name, kind, file, line, col,
+  ## is-local.
+  result = SemanticSymbol(name: fields[1], kind: fields[2], uri: "", doc: "")
+  let source = if fields[3].len > 0: realFile(fields[3]) else: ""
+  if source.len == 0: return
+  result.uri = doc.uriForPath(source)
+  var lineNo, column = 0
+  try:
+    lineNo = parseInt(fields[4]).int
+    column = parseInt(fields[5]).int
+  except:
+    return
+  result.doc = doc.docCommentAt(source, lineNo, column, fields[1])
+  result.range = doc.sourceRange(source, lineNo, column, fields[1])
+
 proc parseIdeSnapshot(doc: Document; content: string; queryLine,
                       queryCharacter: int): SemanticSnapshot {.raises.} =
   result = SemanticSnapshot(queried: true, matched: false,
-                           visible: @[], candidates: @[])
-  for line in content.splitLines:
-    let fields = line.split('\t')
+                            visible: @[], candidates: @[])
+  let rows = content.splitLines()
+  var i = 0
+  while i < rows.len:
+    let fields = rows[i].split('\t')
+    inc i
     if fields.len == 2 and fields[0] == "matched":
       result.matched = fields[1] == "true"
-    elif fields.len >= 7 and fields[0] in ["visible", "candidate"]:
+    elif fields.len >= 5 and fields[0] == "position":
+      # Document mode. The header carries the count of the `candidate` rows
+      # that FOLLOW it, so they are consumed here rather than matched by tag:
+      # two occurrences of one name on one line each get their own run.
+      var lineNo, column, count = 0
+      try:
+        lineNo = parseInt(fields[1]).int
+        column = parseInt(fields[2]).int
+        count = parseInt(fields[4]).int
+      except:
+        continue
+      var symbols: seq[SemanticSymbol] = @[]
+      for id in 0 ..< count:
+        if i >= rows.len: break
+        let candidate = rows[i].split('\t')
+        inc i
+        if candidate.len >= 7 and candidate[0] == "candidate":
+          symbols.add doc.symbolFromFields(candidate)
+      result.positions.add IdePosition(line: lineNo, column: column,
+                                       name: unescapeTsv(fields[3]),
+                                       symbols: symbols)
+    elif fields.len >= 7 and fields[0] == "import":
+      result.imports.add doc.symbolFromFields(fields)
+    elif fields.len >= 7 and fields[0] == "visible":
       var lineNo, column = 0
       try:
         lineNo = parseInt(fields[4])
@@ -526,6 +594,17 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
         else: result.candidates.add symbol
 
 proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSnapshot {.raises.} =
+  ## The answer for a cursor position. When the document was checked in document
+  ## mode this is a lookup in the recorded positions and spawns nothing; the
+  ## per-position compile is the fallback for a snapshot that has none.
+  if doc.snapshot.positions.len > 0:
+    let position = doc.snapshot.positionAt(line, character)
+    result = SemanticSnapshot(queried: true, matched: position.symbols.len > 0,
+                              documentMode: true, visible: @[],
+                              candidates: position.symbols,
+                              imports: doc.snapshot.imports,
+                              positions: @[])
+    return
   if doc.queryCached and doc.queryLine == line and doc.queryCharacter == character:
     return doc.queryResult
   result = SemanticSnapshot(queried: true, matched: false,

@@ -174,7 +174,30 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
   result = "{\"isIncomplete\":false,\"items\":["
   var labels = initHashSet[string]()
   var first = true
-  if query.queried and query.matched:
+  if query.documentMode:
+    # Document mode records the module's import table once instead of the scope
+    # chain at a cursor, so offer those names and let the lexical index supply
+    # the ones local to this scope.
+    for symbol in query.imports:
+      let name = symbol.name
+      if name in labels: continue
+      labels.incl name
+      if not first: result.add ','
+      first = false
+      let kind = if symbol.kind in ["proc", "func", "iterator", "method",
+                                    "template", "macro", "converter"]: 3 else: 6
+      result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
+        ",\"detail\":" & quoteJson(symbol.kind) & "}"
+    for id in doc.visible(line, character):
+      let n = doc.nodes[id]
+      if n.text in labels: continue
+      labels.incl n.text
+      if not first: result.add ','
+      first = false
+      let kind = if n.declarationKind in ["proc", "func", "iterator", "method"]: 3 else: 6
+      result.add "{\"label\":" & quoteJson(n.text) & ",\"kind\":" & $kind &
+        ",\"detail\":" & quoteJson(n.declarationKind) & "}"
+  elif query.queried and query.matched:
     for symbol in query.visible:
       let name = symbol.name
       if name in labels: continue

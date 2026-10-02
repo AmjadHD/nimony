@@ -214,7 +214,7 @@ proc visibleDeclarationAtCursor*(c: var SemContext; identifier: StrId;
   result = createTokenBuf(8)
   discard buildSymChoice(c, result, identifier, info, InnerMost)
 
-proc ideSymbol(c: var SemContext; dest: TokenBuf; id: SymId): IdeSymbol =
+proc ideSymbol*(c: var SemContext; dest: TokenBuf; id: SymId): IdeSymbol =
   result = IdeSymbol(id: id, kind: NoSym, info: NoLineInfo)
   var scope = c.currentScope
   while scope != nil:
@@ -231,7 +231,7 @@ proc ideSymbol(c: var SemContext; dest: TokenBuf; id: SymId): IdeSymbol =
     result.kind = loaded.decl.symKind
     result.info = loaded.decl.info
 
-proc symbolUses(buf: var TokenBuf): seq[SymId] =
+proc symbolUses*(buf: var TokenBuf): seq[SymId] =
   result = @[]
   var choice = beginRead(buf)
   if choice.isTagLit:

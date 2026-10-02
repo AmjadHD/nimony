@@ -7,46 +7,54 @@ hover, and go-to-definition.
 
 The document database stores syntax-token nodes with source ranges and lexical
 scope identities. For identifier queries, the server invokes `nimony check`
-with `--visible`; phase 3 captures the active `SemContext` scope-chain results
-and resolved name candidates. The query path retains `ErrT` nodes and returns
-its snapshot rather than failing on semantic errors elsewhere in the module.
+with `--visible`; phase 3 captures the `SemContext` scope-chain results and
+resolved name candidates. The query path retains `ErrT` nodes and returns its
+snapshot rather than failing on semantic errors elsewhere in the module.
 An edit reparses and rechecks its containing document, while individual syntax
 nodes remain the database records. This is an explicit boundary: Nimony's
 existing incremental build graph does not provide node-granular semantic
 invalidation. LSP parser, dependency, and semantic artifacts live only below
 `nimcache/lsp/`; batch compilation never reads them.
 
-## Known limitation: one compiler process per query
+## Document mode: one compile per edit
 
-Queries shell out. Every hover, definition or completion request spawns
-`nimony check`, which re-resolves the document and its whole import graph. The
-cache holds exactly one `(line, character)`, so only an *immediately* repeated
-position is free: moving away and back costs another process. Measured over
-stdio on a document importing five stdlib modules (Termux, 8 cores):
+`nimony check --visible:FILE,0,0` runs in *document mode*. Line 0 is not a
+source line, so instead of matching one cursor it records, in a single sem pass:
 
-| operation | cost |
-| --- | --- |
-| first query, empty `nimcache/lsp/` | ~2.4 s |
-| query at a cursor position not cached | ~100 ms |
-| query repeated at the cached position | ~0 ms |
+- every identifier occurrence in the file and what it resolved to
+  (`position` rows, each followed by its own `candidate` rows),
+- the module's import table (`import` rows), which does not depend on a cursor,
+- the semantic errors (`error` rows).
 
-The ~100 ms is the build graph reusing already-parsed and already-semmed
-`.s.nif` artifacts for the imports; it is not a cheap query. Moving the cursor
-one line re-resolves the document's own scopes from zero, and a larger import
-graph makes the cold case worse. An editor that re-queries on every keystroke
-and mouse move will feel this.
+The editor indexes the occurrences by position, so hover and go-to-definition
+are table lookups. Measured over stdio on a document importing five stdlib
+modules (Termux, 8 cores):
 
-This is a bridge transport, not a steady-state design. It exists because it
-proves the `--visible` flag and the TSV wire format are semantically correct.
-Replacing it means keeping a warm `SemContext` per open document inside the
-server process and re-running only on text change, which needs an audit of what
-`nimsem` assumes is single-process, short-lived global state (symbol pools,
-interning tables), in the same spirit as the parallel-compiler audit. Until that
-lands, per-query process spawn is the expected price of a semantic answer.
+| operation | before | after |
+| --- | --- | --- |
+| open, empty `nimcache/lsp/` | ~2.4 s | ~2.7 s |
+| hover, first time | ~100 ms | ~1 ms |
+| hover, cursor moved away and back | ~100 ms | ~0 ms |
+| `didChange` | ~100 ms per query | ~400 ms once |
 
-`tests/lsp/queries.nim` exercises this path. Note that the in-process timings it
-prints are not trustworthy on every platform — `getMonoTime` does not advance
-reliably here — so measure latency from outside the process.
+The cost moved to the edit, which is where it belongs: it is paid once per
+version instead of once per cursor move. The cold case got slightly slower
+because one pass now records every occurrence rather than one.
+
+Completion in document mode offers the recorded import table plus the names the
+lexical index finds in the local scope chain. It does not see module-level
+symbols declared in *other* files (that is what the import table is), and a name
+declared later in the file is offered the same way the lexical index offers it.
+The cursor-specific `--visible:FILE,LINE,COL` mode still exists and still
+returns the full scope chain at that position; `ideQueryAt` falls back to it when
+a snapshot has no positions.
+
+The remaining cost is the subprocess itself: one `nimony check` per document
+version, re-resolving the document and its import graph. That is the bridge
+described above, and removing it means keeping a warm `SemContext` per open
+document inside the server process, which needs an audit of what `nimsem` assumes
+is single-process, short-lived global state (symbol pools, interning tables), in
+the same spirit as the parallel-compiler audit.
 
 Parser recovery is a safe in-place extension because it preserves the grammar's
 ordinary FIRST/FOLLOW analysis and emits balanced `(err ...)` nodes only when

@@ -1450,10 +1450,36 @@ proc cursorMatchesName(info: NifLineInfo; name: StrId; query: IdeQuery): bool =
 
 proc captureIdeName(c: var SemContext; dest: var TokenBuf; ident: StrId;
                      info: NifLineInfo) =
+  if not c.ideQuery.enabled: return
+  if c.ideQuery.documentMode:
+    # Every occurrence in the tracked file, so the editor can answer any cursor
+    # position from one compile. The per-occurrence cost is one name lookup;
+    # `visibleSymbolsAtCursor` is far too expensive to run here and is left to
+    # the cursor-specific path.
+    if not info.file.isValid or info.file != c.ideQuery.info.file: return
+    c.ideQuery.positions.add IdeResolution(name: ident, info: info,
+      candidates: c.visibleDeclarationsAtCursor(ident, info, dest))
+    c.ideQuery.matched = true
+    return
   if c.ideQuery.matched or not cursorMatchesName(info, ident, c.ideQuery): return
   c.ideQuery.candidates = c.visibleDeclarationsAtCursor(ident, info, dest)
   c.ideQuery.visible = c.visibleSymbolsAtCursor(dest, c.ideQuery.info)
   c.ideQuery.matched = true
+
+proc captureIdeImports*(c: var SemContext; dest: var TokenBuf) =
+  ## The module's import table, independent of any cursor position. Recorded
+  ## once so completion can offer imported names without a per-position run.
+  if not c.ideQuery.enabled or not c.ideQuery.documentMode: return
+  if c.ideQuery.imports.len > 0: return
+  for name in keys(c.importTab):
+    var choice = c.visibleDeclarationAtCursor(name, NoLineInfo)
+    for sym in symbolUses(choice):
+      var seen = false
+      for existing in c.ideQuery.imports:
+        if existing.id == sym:
+          seen = true
+          break
+      if not seen: c.ideQuery.imports.add c.ideSymbol(dest, sym)
 
 proc uniqueTypeCandidate(c: var SemContext; dest: var TokenBuf; choiceAt: int): SymId =
   ## The one type in the symbol choice at `choiceAt`, or `SymId(0)` if there are

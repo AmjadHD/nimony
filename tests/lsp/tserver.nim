@@ -43,6 +43,17 @@ proc runTests() {.raises.} =
   let hover = handle(db, """{"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
   assert hover.response.contains("let local")
 
+  # Document mode records every occurrence, so a position the cursor has never
+  # visited answers from the same snapshot instead of a fresh compile.
+  let doc = db.document(uri)
+  assert doc.snapshot.positions.len > 0
+  var sawUnresolved = false
+  for position in doc.snapshot.positions:
+    if position.symbols.len == 0: sawUnresolved = true
+  assert sawUnresolved
+  let revisited = handle(db, """{"jsonrpc":"2.0","id":21,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
+  assert revisited.response.contains("let local")
+
   let semanticCompletion = handle(db, """{"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
   assert semanticCompletion.response.contains("\"label\":\"local\"")
   assert semanticCompletion.response.contains("\"label\":\"global\"")

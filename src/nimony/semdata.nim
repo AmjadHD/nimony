@@ -145,11 +145,25 @@ type
     kind*: SymKind
     info*: NifLineInfo
 
+  IdeResolution* = object
+    ## What one identifier occurrence resolved to. An unresolved name is a
+    ## position with no candidates, which is what hover and go-to-definition
+    ## have to be able to say.
+    name*: StrId
+    info*: NifLineInfo
+    candidates*: seq[IdeSymbol]
+
   IdeQuery* = object
-    enabled*, matched*: bool
+    enabled*, matched*, documentMode*: bool
     info*: NifLineInfo
     name*: StrId
     visible*, candidates*: seq[IdeSymbol]
+    ## Document mode (track line 0) fills this with EVERY identifier in the
+    ## module instead of stopping at the first match, so one compile answers
+    ## every cursor position until the text changes.
+    positions*: seq[IdeResolution]
+    ## The module's import table, which does not depend on the cursor.
+    imports*: seq[IdeSymbol]
 
   # SemPhase and ToplevelEntry are now in programs.nim
 
