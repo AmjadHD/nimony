@@ -50,12 +50,21 @@ returns the full scope chain at that position; `ideQueryAt` falls back to it whe
 a snapshot has no positions.
 
 Coverage is measured by asking hover at every identifier token of a file,
-skipping comments and string literals. On this branch, `src/lsp/handlers.nim`
-answers 745 of 848 (87.9%) and `src/lsp/server.nim` 90 of 101 (89.1%). What
-does not answer is the module path in an `import` list and a pragma name --
-neither is an identifier in the checked tree. Every real occurrence -- a
-parameter in a signature, a field chosen through a dot, a name imported from
-another module, a local shadowed in an inner scope -- is recorded.
+skipping comments and string literals. On this branch, measured on a *cold*
+`nimcache/lsp` with nothing pre-built, `src/lsp/handlers.nim` answers 743 of 778
+(95.5%), `src/lsp/server.nim` 90 of 101 (89.1%) and `src/lsp/database.nim` 2181
+of 2280 (95.7%). The cold build matters: an earlier measurement of 87.9% was
+taken with the cache already warm, which silently pre-seeded the very dependency
+the cold path needs and made a broken configuration look like a coverage gap.
+
+Most of what does not answer is the module path in an `import` list and a pragma
+name -- neither is an identifier in the checked tree, and together they account
+for every miss in `server.nim`. What is left is a real gap: a `proc`'s declared
+return type is not recorded (`proc quoteJson(s: string): string` answers for
+`s` but not for the result type), and the magic `result` is not. Every other
+real occurrence -- a parameter in a signature, a field chosen through a dot, a
+name imported from another module, a local shadowed in an inner scope -- is
+recorded.
 
 Two details make that work. The walk reads the finished phase-3 tree rather
 than a resolution callback, so it sees occurrences wherever the tree puts them.
@@ -63,6 +72,26 @@ And NIF line info for a `dot` expression's field points at the operator rather
 than at the name (`node.c` records the column of the `e` ending `node`), so each
 recorded column is snapped to the name on its line once, when the sidecar is
 parsed, rather than on every query.
+
+The root module is handed to sem as an already-parsed `.nif`, which is what
+makes the editor's fault-tolerant parse possible: `execNifler` returns
+immediately for a `.nif`, so the buffer is parsed by the recovering parser in
+this process and never re-parsed by the fail-fast one. The price is that the
+root's directory becomes the cache directory rather than the source tree, and a
+`./`-less sibling import is resolved against the importing file's own directory.
+So `src/lsp/handlers.nim`'s `import database` had nowhere to resolve to: nimony
+created the node with no parse rule and the build died with `cannot open:
+<mod>.s.nif`. The open document's directory therefore goes on the search path in
+`runCompiler`, and the LSP no longer asserts anything about the dependency graph
+-- nimony parses the dependencies and applies its own mtime and `OnlyIfChanged`
+rules, which is also why the result cannot go stale underneath the editor.
+
+A failed compile must never look like a clean one. `execCmdEx` reports failure
+through its exit code and does not raise, so `runCompiler` logs the compiler's
+own first error line to stderr and reports the failure as a diagnostic. Without
+that, a build that died produced an empty sidecar, which the server published as
+"no errors" and answered every query from -- the file simply stopped working for
+reasons the user cannot see.
 
 The remaining cost is the subprocess itself: one `nimony check` per document
 version, re-resolving the document and its import graph. That is the bridge

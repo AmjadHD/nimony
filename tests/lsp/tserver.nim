@@ -1,4 +1,4 @@
-import std / [assertions, os, strutils, uri]
+import std / [assertions, os, strutils, syncio, uri]
 import ../../src/lsp/[database, handlers]
 
 proc uriPathForTest(uriText: string): string {.raises.} =
@@ -140,6 +140,33 @@ proc runTests() {.raises.} =
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"}}}""")
   assert db.document(uri) == nil
   assert not fileExists(cacheFile)
+
+  # A `./`-less sibling import has to keep working. The root is handed to sem as
+  # a pre-parsed `.nif` under the cache dir, so the root's directory is the cache
+  # dir and not the source tree -- which is exactly where `import sibling_helper`
+  # used to resolve to nothing. The symptom was not a missing hover but a build
+  # that died on `cannot open: <mod>.s.nif`, published to the editor as an empty
+  # diagnostic list, so these assertions pin both halves: no failure notice, and
+  # a definition that really lands in the sibling file.
+  #
+  # A relative URI is passed through `uriPath` unchanged, which keeps the
+  # messages literal and exercises the relative-vs-absolute path comparison in
+  # the compiler at the same time.
+  assert readFile("tests/lsp/sibling/sibling_dep.nim").replace("\r\n", "\n") ==
+    "import sibling_dep_helper\n\nproc useSibling*(): int =\n  siblingAnswer()\n"
+  let sibOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"tests/lsp/sibling/sibling_dep.nim","languageId":"nim","version":1,"text":"import sibling_dep_helper\n\nproc useSibling*(): int =\n  siblingAnswer()\n"}}}""")
+  assert not sibOpened.notification.contains("semantic analysis failed"),
+         "the sibling module's compile failed: " & sibOpened.notification
+  assert db.document("tests/lsp/sibling/sibling_dep.nim").snapshot.positions.len > 0,
+         "the sibling document recorded no identifier occurrences"
+
+  let sibHover = handle(db, """{"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":"tests/lsp/sibling/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
+  assert sibHover.response.contains("siblingAnswer"),
+         "no hover for the sibling's symbol: " & sibHover.response
+
+  let sibDef = handle(db, """{"jsonrpc":"2.0","id":91,"method":"textDocument/definition","params":{"textDocument":{"uri":"tests/lsp/sibling/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
+  assert sibDef.response.contains("sibling_dep_helper.nim"),
+         "definition did not reach the sibling: " & sibDef.response
 
 try:
   runTests()

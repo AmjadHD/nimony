@@ -258,9 +258,15 @@ proc runDiagnostics*(db: var Database; doc: var Document) {.raises.} =
   doc.queryLine = -1
   doc.queryCharacter = -1
   let content = db.runCompiler(doc)
-  doc.snapshot = parseIdeSnapshot(doc, content, -1, -1)
+  doc.snapshot = parseIdeSnapshot(doc, content.sidecar, -1, -1)
   correctPositionColumns(doc)
-  doc.semanticDiagnostics = semanticErrors(content)
+  doc.semanticDiagnostics = semanticErrors(content.sidecar)
+  # A compile that failed is not a file without errors. Reporting it as clean is
+  # what turns a build problem into an editor that looks broken, so the failure
+  # is surfaced in place rather than swallowed.
+  if content.failure.len > 0:
+    doc.semanticDiagnostics.add ParseDiagnostic(line: 0, col: 0,
+      message: "semantic analysis failed: " & content.failure)
 
 proc updateDocument*(db: var Database; uri, path: string; version: int;
                      text: string): Document {.raises.} =
@@ -342,10 +348,22 @@ proc unescapeTsv(s: string): string =
 proc moduleNameForPath*(db: Database; path: string): string =
   moduleSuffix(path, db.modulePaths)
 
-proc runCompiler*(db: Database; doc: Document): string {.raises.} =
+proc firstErrorLine(output: string): string =
+  ## The compiler's own first complaint, so a log line explains the failure
+  ## instead of just its exit code. nifmake wraps the real error in
+  ## `[Error] ...`, which is the line worth keeping.
+  for line in output.splitLines:
+    if line.strip.len > 0:
+      return line.strip
+  ""
+
+proc runCompiler*(db: Database; doc: Document): tuple[sidecar: string,
+                                                       failure: string] {.raises.} =
   ## Run sem for `doc` and return its sidecar. Both the semantic query and the
   ## diagnostics come out of this one invocation, so a query never costs a
-  ## second compile.
+  ## second compile. `failure` is non-empty when the compiler did not produce a
+  ## usable result, which the caller must not confuse with "no errors".
+  result = (sidecar: "", failure: "")
   let compiler = db.compilerRoot / "bin" / "nimony"
   let ideFile = db.cacheDir / (doc.moduleName & ".ide.tsv")
   let semFile = db.cacheDir / (doc.moduleName & ".s.nif")
@@ -356,6 +374,19 @@ proc runCompiler*(db: Database; doc: Document): string {.raises.} =
     discard
   var command = quoteShell(compiler) & " --base:" & quoteShell(db.root) &
     " --nimcache:" & quoteShell(db.cacheDir)
+  # The root handed to sem is a pre-parsed `.nif` under the cache dir, so its
+  # own directory is the cache dir rather than the source tree. A `./`-less
+  # sibling import (`import database`) is resolved against the *importing
+  # file's* directory, so without the open document's directory on the search
+  # path such a module resolves to nothing: nimony creates the node with no
+  # parse rule and the build dies with `cannot open: <mod>.s.nif`. That is the
+  # whole reason a file importing its siblings failed while an identical file
+  # importing only `std` worked. The path is added here rather than in
+  # `modulePaths` because that one feeds `moduleSuffix`, and widening it would
+  # change module names for files that already work.
+  let docDir = parentDir(doc.path)
+  if docDir.len > 0:
+    command.add " --path:" & quoteShell(docDir)
   for searchPath in db.modulePaths:
     command.add " --path:" & quoteShell(searchPath)
   command.add " check " & quoteShell(doc.parsedFile)
@@ -369,8 +400,23 @@ proc runCompiler*(db: Database; doc: Document): string {.raises.} =
     while lineStart > 0 and doc.text[lineStart - 1] != '\n': dec lineStart
     track = doc.path & "," & $(doc.queryLine + 1) & "," & $(offset - lineStart + 1)
   command.add " --visible:" & quoteShell(track)
-  let _ = execCmdEx(command, workingDir = db.root)
-  if os.fileExists(ideFile): readFile(ideFile) else: ""
+  # `execCmdEx` reports failure through its exit code and does not raise, so a
+  # compile that died would otherwise be indistinguishable from a clean run with
+  # no errors. That is the worst possible failure for an editor: it clears the
+  # diagnostics and answers every query from an empty snapshot, so the file
+  # simply "stops working" for reasons the user cannot see. A failed run must
+  # say so.
+  let (output, exitCode) = execCmdEx(command, workingDir = db.root)
+  if exitCode != 0:
+    stderr.writeLine "[nimony-lsp] compile failed (exit " & $exitCode & ") for " &
+      doc.path
+    stderr.writeLine "[nimony-lsp] " & firstErrorLine(output)
+  if os.fileExists(ideFile):
+    result.sidecar = readFile(ideFile)
+  if exitCode != 0:
+    result.failure = "compiler exited with " & $exitCode
+  elif result.sidecar.len == 0:
+    result.failure = "compiler produced no result for this file"
 
 proc semanticErrors*(content: string): seq[ParseDiagnostic] =
   ## Undeclared identifiers and the other semantic errors, as the sidecar
@@ -669,7 +715,7 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSna
   doc.queryLine = line
   doc.queryCharacter = character
   let content = db.runCompiler(doc)
-  if content.len > 0: result = parseIdeSnapshot(doc, content, line, character)
+  if content.sidecar.len > 0: result = parseIdeSnapshot(doc, content.sidecar, line, character)
   doc.queryCached = true
   doc.queryLine = line
   doc.queryCharacter = character
