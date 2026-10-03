@@ -132,7 +132,26 @@ later query. Parser and semantic diagnostics are published together.
 
 ## Hover documentation
 
-NIF carries no comments -- the parser discards them -- so hover reads the `##`
-block directly above a declaration back from the source text, stopping at the
-first line that is not a doc comment. That scan runs against the editor's own
-buffer for the open document and against the file on disk for imported symbols.
+The parser records every `##` block, keyed by the line the block ends on, so a
+declaration is documented exactly when the line above it is where its comment
+finished. The lexer has already merged consecutive `##` lines into one token and
+stripped their indentation, which is why a two-paragraph block, a `##[` run and a
+list inside a comment all come out as the author wrote them without this side
+having to know about any of those shapes. A `#` comment is not a doc comment:
+the lexer never makes it a token, so it cannot be mistaken for one.
+
+Recording is opt-in (`Parser.keepComments`) and only the editor sets it. The
+grammar's `comment[ COMMENT ]` slot looks like the place for the text and is not:
+`commentStmt` is wired only into the statement lists that name it, so a `##`
+inside an object body reaches `emitLeaf` with no wrapper at all, and emitting a
+string there leaves a bare literal between the fields, which sem reports as
+ill-formed. Keeping the text out of the tree entirely leaves the written NIF
+byte-identical and no consumer able to notice.
+
+Imported symbols are still read from the file on disk with a line scan, because
+the tree only holds the open document. That is where the remaining weakness is:
+it cannot see a `##[` block, and it shows a stale copy for another file that is
+open but unsaved. Carrying comments through sem would fix both, and NIF already
+has the transport for it -- `NifLineInfo.comment` rides along as a `#...#`
+decoration and `nifbuilder.attachComment` writes it -- but sem propagates it in
+exactly one place today (`templates.nim`), so nothing has ever round-tripped it.

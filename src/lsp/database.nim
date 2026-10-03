@@ -51,6 +51,9 @@ type
     semanticDiagnostics*: seq[ParseDiagnostic] ## from the compiler's sem pass
     snapshot*: SemanticSnapshot  ## every identifier occurrence, from one check
     nifTree*: string
+    docComments*: Table[int, string]
+      ## `##` documentation keyed by the line the block ends on, as the parser
+      ## recorded it -- not re-scanned from the text
     cacheFile*: string
     parsedFile*: string
     moduleName*: string
@@ -274,7 +277,11 @@ proc updateDocument*(db: var Database; uri, path: string; version: int;
                      version: version, text: text)
   var p = openParser(text, path, pool, globalTags)
   p.recovering = true
+  # Only the editor wants the `##` text: batch parsing leaves the tree exactly
+  # as it was, and the language server is the only caller that sets this.
+  p.keepComments = true
   parseModule p
+  doc.docComments = p.docComments
   doc.diagnostics = p.errors
   let tree = finish(p)
   doc.nifTree = toString(tree)
@@ -474,11 +481,24 @@ proc resolve*(doc: Document; nodeId: int): seq[int] =
 
 proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
                    name: string): string =
-  ## The `##` block directly above a declaration. NIF carries no comments --
-  ## the parser drops them -- so the text is read back from the source. The
-  ## scan stops at the first line that is not a doc comment, which is what makes
-  ## this the comment for THIS declaration and not one further up.
+  ## The `##` block documenting a declaration.
+  ##
+  ## For the open document the text is what the parser recorded, which is exact:
+  ## it is the block the lexer actually merged, so a `##[` run, a blank `##` line
+  ## between paragraphs and leading indentation all come out right without this
+  ## function having to know about any of them. A declaration is documented
+  ## exactly when the line above it is where its block ended; `lineNo` arrives
+  ## 1-based from some call sites and 0-based from others, so both are tried.
+  ##
+  ## For any *other* file the tree has nothing -- it only holds the open
+  ## document -- so the text is scanned lexically there, exactly as before. That
+  ## is the remaining weak spot: it reads the file from disk, so it shows a stale
+  ## copy for another open-but-unsaved buffer, and it cannot see a `##[` block.
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  if path == doc.path:
+    for line in [lineNo - 2, lineNo - 1]:
+      let found = doc.docComments.getOrDefault(line, "")
+      if found.len > 0: return found
   var text = ""
   if path == doc.path: text = doc.text
   else:

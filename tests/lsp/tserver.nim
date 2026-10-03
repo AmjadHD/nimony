@@ -152,21 +152,79 @@ proc runTests() {.raises.} =
   # A relative URI is passed through `uriPath` unchanged, which keeps the
   # messages literal and exercises the relative-vs-absolute path comparison in
   # the compiler at the same time.
-  assert readFile("tests/lsp/sibling/sibling_dep.nim").replace("\r\n", "\n") ==
+  assert readFile("tests/lsp/fixtures/sibling_dep.nim").replace("\r\n", "\n") ==
     "import sibling_dep_helper\n\nproc useSibling*(): int =\n  siblingAnswer()\n"
-  let sibOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"tests/lsp/sibling/sibling_dep.nim","languageId":"nim","version":1,"text":"import sibling_dep_helper\n\nproc useSibling*(): int =\n  siblingAnswer()\n"}}}""")
+  let sibOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim","languageId":"nim","version":1,"text":"import sibling_dep_helper\n\nproc useSibling*(): int =\n  siblingAnswer()\n"}}}""")
   assert not sibOpened.notification.contains("semantic analysis failed"),
          "the sibling module's compile failed: " & sibOpened.notification
-  assert db.document("tests/lsp/sibling/sibling_dep.nim").snapshot.positions.len > 0,
+  assert db.document("tests/lsp/fixtures/sibling_dep.nim").snapshot.positions.len > 0,
          "the sibling document recorded no identifier occurrences"
 
-  let sibHover = handle(db, """{"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":"tests/lsp/sibling/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
+  let sibHover = handle(db, """{"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
   assert sibHover.response.contains("siblingAnswer"),
          "no hover for the sibling's symbol: " & sibHover.response
 
-  let sibDef = handle(db, """{"jsonrpc":"2.0","id":91,"method":"textDocument/definition","params":{"textDocument":{"uri":"tests/lsp/sibling/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
+  let sibDef = handle(db, """{"jsonrpc":"2.0","id":91,"method":"textDocument/definition","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
   assert sibDef.response.contains("sibling_dep_helper.nim"),
          "definition did not reach the sibling: " & sibDef.response
+
+  # Hover documentation comes from the parser, not from a scan of the text. The
+  # text used to be re-read with a line walk, which could not see a `##[` block
+  # and had to be fooled about indentation; the parser merges the block, strips
+  # it and hands it over, so the awkward shapes come out right for free. A `#`
+  # comment is not documentation and must stay invisible.
+  #
+  # Keyed by the line the block ENDS on, so a declaration is documented exactly
+  # when the line above it is where its comment finished.
+  # An absolute `file://` URI, which is what an editor actually sends. A bare
+  # relative path parses and indexes but does not resolve through hover.
+  let docFixturePath = getCurrentDir() / "tests" / "lsp" / "fixtures" /
+    "documented.nim"
+  let docFixtureUri = "file://" & docFixturePath
+  let docFixtureText = readFile(docFixturePath).replace("\r\n", "\n")
+  # Built with escaped quotes rather than by splicing triple-quoted literals:
+  # a `"""` ending next to a `"` loses the quote, which silently unquotes the
+  # URI and makes the whole message unparseable.
+  let docFixtureMsg = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & docFixtureUri &
+    "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
+    docFixtureText.replace("\n", "\\n") & "\"}}}"
+  let docFixtureOpened = handle(db, docFixtureMsg)
+  assert not docFixtureOpened.notification.contains("semantic analysis failed"),
+         "the documented fixture failed to compile: " & docFixtureOpened.notification
+  let docFixtureDoc = db.document(docFixtureUri)
+  assert docFixtureDoc != nil,
+         "document not stored: " & docFixtureOpened.response & " / " &
+         docFixtureOpened.notification
+  let docFixtureComments = docFixtureDoc.docComments
+  # The module header, the one documented field, `simple`, `twoParagraphs`,
+  # `blockDoc` and the comment inside `usesBodyDoc`'s body. Nothing else: the
+  # `#` comments and `undocumented`, `usesBodyDoc` and `nested` have none.
+  assert docFixtureComments.len == 6,
+         "recorded " & $docFixtureComments.len & " doc comments, expected 6"
+  # A `#` comment is not a doc comment, and the two-paragraph and `##[` blocks
+  # keep the blank line and the shape the author wrote.
+  assert docFixtureComments.getOrDefault(8, "").len == 0
+  assert docFixtureComments.getOrDefault(20, "").contains("- one")
+  assert docFixtureComments.getOrDefault(25, "").contains("It spans lines")
+  # A `##` inside a body documents the next declaration in that body, which is
+  # what makes the line-above rule correct rather than merely convenient.
+  assert docFixtureComments.getOrDefault(34, "") ==
+    "Documents the declaration below, not this one."
+  assert docFixtureComments.getOrDefault(2, "").contains("Second line of it.")
+  assert docFixtureComments.getOrDefault(11, "") == "A simple one-line doc."
+  assert docFixtureComments.getOrDefault(6, "").contains("field's own documentation")
+  # `undocumented` sits under a `#` comment (line 29) and `usesBodyDoc` under
+  # nothing (line 33), so neither line is a key.
+  assert not docFixtureComments.hasKey(29)
+  assert not docFixtureComments.hasKey(33)
+
+  let dd = db.document(docFixtureUri)
+  let simpleHover = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"textDocument/hover\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & docFixtureUri &
+    "\"},\"position\":{\"line\":11,\"character\":7}}}")
+  assert simpleHover.response.contains("A simple one-line doc."),
+         "hover lost the doc comment: " & simpleHover.response
 
 try:
   runTests()
