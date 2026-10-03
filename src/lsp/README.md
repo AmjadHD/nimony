@@ -49,6 +49,21 @@ The cursor-specific `--visible:FILE,LINE,COL` mode still exists and still
 returns the full scope chain at that position; `ideQueryAt` falls back to it when
 a snapshot has no positions.
 
+Coverage is measured by asking hover at every identifier token of a file,
+skipping comments and string literals. On this branch, `src/lsp/handlers.nim`
+answers 745 of 848 (87.9%) and `src/lsp/server.nim` 90 of 101 (89.1%). What
+does not answer is the module path in an `import` list and a pragma name --
+neither is an identifier in the checked tree. Every real occurrence -- a
+parameter in a signature, a field chosen through a dot, a name imported from
+another module, a local shadowed in an inner scope -- is recorded.
+
+Two details make that work. The walk reads the finished phase-3 tree rather
+than a resolution callback, so it sees occurrences wherever the tree puts them.
+And NIF line info for a `dot` expression's field points at the operator rather
+than at the name (`node.c` records the column of the `e` ending `node`), so each
+recorded column is snapped to the name on its line once, when the sidecar is
+parsed, rather than on every query.
+
 The remaining cost is the subprocess itself: one `nimony check` per document
 version, re-resolving the document and its import graph. That is the bridge
 described above, and removing it means keeping a warm `SemContext` per open

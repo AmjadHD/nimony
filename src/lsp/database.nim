@@ -214,7 +214,43 @@ proc indexSyntax(doc: var Document) =
     col += utf16Width(ch)
     inc i
 
-proc runDiagnostics*(db: var Database; doc: Document) {.raises.} =
+proc correctPositionColumns(doc: var Document) {.raises.} =
+  ## NIF line info for a `dot` expression's field points at the operator rather
+  ## than at the name (`node.c` records the column of `e`, the end of `node`),
+  ## so a recorded column can be off by one or more. Each column is snapped to
+  ## the name on that line once here, rather than on every query. A column that
+  ## already holds the name is left alone, and one that finds nothing is left
+  ## alone too -- a wrong guess would be worse than none.
+  let lines = doc.lineText
+  if lines.len == 0: return
+  for id in 0 ..< doc.snapshot.positions.len:
+    let position = doc.snapshot.positions[id]
+    if position.name.len == 0: continue
+    var index = position.line - 1
+    if index < 0 or index >= lines.len: continue
+    let line = lines[index]
+    if position.column >= 0 and position.column + position.name.len <= line.len and
+        line.substr(position.column, position.column + position.name.len - 1) == position.name:
+      continue
+    var found = -1
+    var start = max(0, position.column)
+    while start + position.name.len <= line.len:
+      if line.substr(start, start + position.name.len - 1) == position.name and
+          (start == 0 or not isIdentContinue(line[start - 1])) and
+          (start + position.name.len == line.len or
+              not isIdentContinue(line[start + position.name.len])):
+        found = start
+        break
+      inc start
+    if found >= 0:
+      doc.snapshot.positions[id].column = found
+
+proc lineText(doc: Document): seq[string] {.raises.} =
+  ## The document split into lines, so a position's column can be snapped to
+  ## the name on its line.
+  doc.text.splitLines
+
+proc runDiagnostics*(db: var Database; doc: var Document) {.raises.} =
   ## One check per document version, in document mode: every identifier
   ## occurrence, the import table and the errors together. Queries then read
   ## this instead of compiling again, so the cost lands on the edit rather than
@@ -223,6 +259,7 @@ proc runDiagnostics*(db: var Database; doc: Document) {.raises.} =
   doc.queryCharacter = -1
   let content = db.runCompiler(doc)
   doc.snapshot = parseIdeSnapshot(doc, content, -1, -1)
+  correctPositionColumns(doc)
   doc.semanticDiagnostics = semanticErrors(content)
 
 proc updateDocument*(db: var Database; uri, path: string; version: int;

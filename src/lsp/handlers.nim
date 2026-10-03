@@ -271,7 +271,7 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
         if kind(changes) == JArray:
           for change in items(changes): source = change.strField("text")
     let version = int(td.intField("version"))
-    let doc = db.updateDocument(uriText, uriPath(uriText), version, source)
+    var doc = db.updateDocument(uriText, uriPath(uriText), version, source)
     db.runDiagnostics(doc)
     result.notification = publishDiagnostics(doc)
   of "textDocument/didClose":

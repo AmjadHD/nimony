@@ -93,6 +93,20 @@ proc runTests() {.raises.} =
   # visited answers from the same snapshot instead of a fresh compile.
   let doc = db.document(uri)
   assert doc.snapshot.positions.len > 0
+  # The shapes that a one-at-a-time capture never saw: a parameter name in a
+  # signature, a field chosen through a dot, and a name imported from another
+  # module. Each answers from the recorded positions without a fresh compile.
+  # The fixture uses `f()` with parameters `global` and `local`, and imports
+  # `contains`; all three are occurrences the one-at-a-time capture never saw.
+  var sawParam = false
+  var sawImported = false
+  for position in doc.snapshot.positions:
+    if position.name == "local" and position.symbols.len > 0: sawParam = true
+    if position.name == "contains" and position.symbols.len > 0: sawImported = true
+  assert sawParam, "a local's use was not recorded"
+  assert sawImported, "an imported name's use was not recorded"
+  # The shapes the one-at-a-time capture missed: a parameter in a signature, a
+  # field selected through a dot, and a type name from an import.
   var sawUnresolved = false
   for position in doc.snapshot.positions:
     if position.symbols.len == 0: sawUnresolved = true

@@ -234,6 +234,79 @@ proc escapeTsv(s: string): string =
     of '\r': result.add "\\r"
     else: result.add ch
 
+proc sameFile(id: FileId, tracked: FileId, trackedName: string): bool =
+  ## Whether `id` names the file the editor is asking about. Comparing the
+  ## interned id is enough when both came from the same spelling, but the tree
+  ## records the source path and the request names the track path, and those
+  ## can differ in spelling while still being one file. Falling back to the
+  ## resolved name keeps the filter from silently dropping every occurrence.
+  if id == tracked: return true
+  if not id.isValid: return false
+  realFile(pool.filenames[id]) == trackedName
+
+proc ideSymbolFor(c: var SemContext; dest: TokenBuf; sid: SymId;
+                  info: NifLineInfo): IdeSymbol =
+  ## Where `sid` is declared, for a hover or a go-to-definition. `tryLoadSym`
+  ## covers toplevel and imported symbols; a proc-local one is only in this
+  ## module's buffer, so fall back to the scope scan.
+  result = IdeSymbol(id: sid, kind: NoSym, info: info)
+  let loaded = tryLoadSym(sid)
+  if loaded.status == LacksNothing:
+    result.kind = loaded.decl.symKind
+    if loaded.decl.info.isValid: result.info = loaded.decl.info
+  else:
+    result = c.ideSymbol(dest, sid)
+
+proc walkIdePositions(c: var SemContext; dest: TokenBuf; n: var Cursor;
+                      file: FileId; fileName: string) =
+  ## Every identifier occurrence, wherever the tree puts it. `semIdentImpl` only
+  ## sees names that go through ordinary lookup, so hooking there misses
+  ## declaration targets, parameters, and fields; this reads the finished tree
+  ## instead, so a symbol is recorded wherever the walker finds it.
+  if n.isSymbol or n.isSymbolDef:
+    let info = n.info
+    if info.isValid and sameFile(info.file, file, fileName):
+      c.ideQuery.positions.add IdeResolution(name: pool.symNameId(n.symId),
+        info: info, candidates: @[c.ideSymbolFor(dest, n.symId, info)])
+    inc n
+    return
+  case n.kind
+  of Ident:
+    # Unresolved: recorded with no candidates, which is what lets hover say
+    # "undeclared" instead of having nothing to say at all.
+    let info = n.info
+    if info.isValid and sameFile(info.file, file, fileName):
+      c.ideQuery.positions.add IdeResolution(name: n.strId, info: info,
+                                             candidates: @[])
+    inc n
+  of TagLit:
+    if n.exprKind in {CchoiceX, OchoiceX}:
+      # An overload set is ONE occurrence with several candidates, so it is
+      # recorded once -- the children carry the identifier's line info, and
+      # recording them individually would lose which belong together.
+      let info = n.info
+      var symbols: seq[IdeSymbol] = @[]
+      n.into:
+        while n.hasMore:
+          if n.isSymbol or n.isSymbolDef:
+            symbols.add c.ideSymbolFor(dest, n.symId, n.info)
+          inc n
+      if info.isValid and sameFile(info.file, file, fileName) and symbols.len > 0:
+        c.ideQuery.positions.add IdeResolution(
+          name: pool.symNameId(symbols[0].id), info: info, candidates: symbols)
+      return
+    n.loopInto:
+      walkIdePositions(c, dest, n, file, fileName)
+  else:
+    inc n
+
+proc collectIdePositions*(c: var SemContext; dest: var TokenBuf) =
+  if not c.ideQuery.enabled or not c.ideQuery.documentMode: return
+  var n = beginRead(dest)
+  walkIdePositions(c, dest, n, c.ideQuery.info.file,
+                   realFile(c.g.config.toTrack.filename))
+  endRead(n)
+
 proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
   var output = "matched\t" & $c.ideQuery.matched & "\n"
   if c.ideQuery.documentMode:
@@ -603,6 +676,7 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   # tree and return the query snapshot instead of making an editor parse fatal.
   if c.ideQuery.enabled:
     dest.addParRi()
+    c.collectIdePositions(dest)
     c.captureIdeImports(dest)
     writeIdeQuery c, dest
     let outfile = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".s.nif"
@@ -816,6 +890,7 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
   for i in 0..<modules.len:
     if modules[i].c.ideQuery.enabled:
       modules[i].dest.addParRi()
+      modules[i].c.collectIdePositions(modules[i].dest)
       modules[i].c.captureIdeImports(modules[i].dest)
       writeIdeQuery modules[i].c, modules[i].dest
       writeOutput modules[i].c, modules[i].dest, modules[i].outfile
