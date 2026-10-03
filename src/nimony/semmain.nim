@@ -242,7 +242,16 @@ proc sameFile(id: FileId, tracked: FileId, trackedName: string): bool =
   ## resolved name keeps the filter from silently dropping every occurrence.
   if id == tracked: return true
   if not id.isValid: return false
-  realFile(pool.filenames[id]) == trackedName
+  let other = realFile(pool.filenames[id])
+  if other == trackedName: return true
+  # The tree keeps the spelling the parse saw and the request may name the same
+  # file absolutely, so both sides are resolved before being compared; that is
+  # the only form of this comparison that does not silently drop every
+  # occurrence when the two spellings differ.
+  try:
+    absolutePath(other) == absolutePath(trackedName)
+  except:
+    false
 
 proc ideSymbolFor(c: var SemContext; dest: TokenBuf; sid: SymId;
                   info: NifLineInfo): IdeSymbol =
@@ -384,13 +393,29 @@ proc phase3(c: var SemContext; buf: var TokenBuf; moduleLineInfo: NifLineInfo): 
   result.addParLe(StmtsS, moduleLineInfo)
   semToplevelStmts(c, result, buf)
 
+proc sameSourceFile(a, b: string): bool =
+  ## Whether two spellings name one file. `realFile` strips expansion
+  ## provenance but not relative-vs-absolute: the tree records whatever spelling
+  ## the parse saw (`src/lsp/handlers.nim`) while the request may name the same
+  ## file absolutely, and comparing those as strings silently disables the whole
+  ## IDE path -- no sidecar, no diagnostics, and an editor that looks broken for
+  ## reasons it cannot see. Resolving both against the working directory is what
+  ## makes the comparison mean "the same file".
+  let x = realFile(a)
+  let y = realFile(b)
+  if x == y: return true
+  try:
+    absolutePath(x) == absolutePath(y)
+  except:
+    false
+
 proc enableIdeQuery(c: var SemContext; source: string) =
   let track = c.g.config.toTrack
   # Line 0 asks for the whole document: every identifier occurrence, the import
   # table and the errors, in one pass. That is what lets an editor answer any
   # cursor position from a single compile. No real line is 0, so the
   # cursor-specific path cannot be reached from document mode.
-  if track.mode == TrackVisible and realFile(track.filename) == realFile(source):
+  if track.mode == TrackVisible and sameSourceFile(track.filename, source):
     c.ideQuery = IdeQuery(enabled: true, documentMode: track.line == 0,
       info: NifLineInfo(file: pool.filenames.getOrIncl(track.filename),
                         line: track.line, col: track.col),
