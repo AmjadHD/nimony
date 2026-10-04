@@ -223,6 +223,35 @@ proc runTests() {.raises.} =
     "\"},\"position\":{\"line\":11,\"character\":7}}}")
   assert simpleHover.response.contains("A simple one-line doc."),
          "hover lost the doc comment: " & simpleHover.response
+
+  # A document sem has already checked but which recorded no occurrences -- an
+  # empty buffer, or one holding only comments -- must not be compiled again per
+  # query. Document mode records every occurrence in the file, so zero positions
+  # means there is no identifier for the per-position mode to find either, and
+  # the cache only covers a repeat of the same line and column. Measured on a new
+  # buffer this cost a ~64ms `nimony check` per cursor position, which is one per
+  # keystroke in a file an editor creates one of per session.
+  #
+  # `queryCached` is set only by the fallback compile path, so it observes the
+  # spawn directly rather than inferring it from a timing.
+  let blankUri = "file:///workspace/lsp-blank.nim"
+  let blankOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-blank.nim","languageId":"nim","version":1,"text":"## only a note\n"}}}""")
+  assert not blankOpened.notification.contains("semantic analysis failed"),
+         "the blank fixture failed to compile: " & blankOpened.notification
+  let blank = db.document(blankUri)
+  assert blank != nil and blank.snapshot.positions.len == 0,
+         "the blank fixture was expected to record no occurrences"
+  assert blank.snapshot.queried,
+         "the blank fixture should have been sem-checked in document mode"
+  # Distinct positions on purpose: the query cache only covers an exact repeat, so
+  # these are the ones that used to compile.
+  for probeLine in [0, 1, 2]:
+    discard handle(db, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"textDocument/hover\"," &
+      "\"params\":{\"textDocument\":{\"uri\":\"" & blankUri &
+      "\"},\"position\":{\"line\":" & $probeLine & ",\"character\":1}}}")
+  assert not blank.queryCached,
+         "a document with no recorded occurrences was compiled per query"
+  discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-blank.nim"}}}""")
   # A `##` block is the documentation of the declaration it follows as the first
   # statement of the body's, and of nothing else. `usesBodyDoc`'s block sits
   # under `usesBodyDoc` and above `nested`, so it belongs to `usesBodyDoc` and

@@ -46,8 +46,14 @@ lexical index finds in the local scope chain. It does not see module-level
 symbols declared in *other* files (that is what the import table is), and a name
 declared later in the file is offered the same way the lexical index offers it.
 The cursor-specific `--visible:FILE,LINE,COL` mode still exists and still
-returns the full scope chain at that position; `ideQueryAt` falls back to it when
-a snapshot has no positions.
+returns the full scope chain at that position; `ideQueryAt` falls back to it only
+for a document sem has not run on. A document that *has* been checked and
+recorded no occurrences -- an empty buffer, or one holding only comments -- is
+not recompiled: document mode records every occurrence in the file, so zero
+positions means the per-position mode has nothing to find either, and the query
+cache only covers a repeat of the same line and column. Compiling anyway cost a
+`nimony check` per cursor position, so a new file paid a full compile on every
+keystroke.
 
 Coverage is measured by asking hover at every identifier token of a file,
 skipping comments and string literals. On this branch, measured on a *cold*

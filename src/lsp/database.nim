@@ -746,7 +746,7 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
 proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSnapshot {.raises.} =
   ## The answer for a cursor position. When the document was checked in document
   ## mode this is a lookup in the recorded positions and spawns nothing; the
-  ## per-position compile is the fallback for a snapshot that has none.
+  ## per-position compile is the fallback for a document sem has not run on.
   if doc.snapshot.positions.len > 0:
     let position = doc.snapshot.positionAt(line, character)
     result = SemanticSnapshot(queried: true, matched: position.symbols.len > 0,
@@ -755,6 +755,18 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSna
                               imports: doc.snapshot.imports,
                               positions: @[])
     return
+  # A checked document can also have *no* recorded positions -- an empty buffer,
+  # or one holding only comments -- and then there is nothing to look up. That is
+  # no reason to compile: document mode records every occurrence in the file, so
+  # zero positions means there is no identifier for the per-position mode to find
+  # either. Compiling anyway cost a `nimony check` per cursor position, and the
+  # cache only covers a repeat of the *same* line and column. So a new file --
+  # which is what an editor creates one of per session -- paid a full compile on
+  # every keystroke, and a large file whose compile failed outright, leaving no
+  # sidecar to record anything, paid one per hover across its whole import graph.
+  if doc.snapshot.queried:
+    return SemanticSnapshot(queried: true, matched: false,
+                            visible: @[], candidates: @[])
   if doc.queryCached and doc.queryLine == line and doc.queryCharacter == character:
     return doc.queryResult
   result = SemanticSnapshot(queried: true, matched: false,
