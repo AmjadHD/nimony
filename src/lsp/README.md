@@ -132,13 +132,16 @@ later query. Parser and semantic diagnostics are published together.
 
 ## Hover documentation
 
-The parser records every `##` block, keyed by the line the block ends on, so a
-declaration is documented exactly when the line above it is where its comment
-finished. The lexer has already merged consecutive `##` lines into one token and
-stripped their indentation, which is why a two-paragraph block, a `##[` run and a
-list inside a comment all come out as the author wrote them without this side
-having to know about any of those shapes. A `#` comment is not a doc comment:
-the lexer never makes it a token, so it cannot be mistaken for one.
+The parser records every `##` block, keyed by the line the block ends on. A
+declaration is documented by the block that *follows* it, because that is where
+a Nim doc comment goes: inline at the end of the declaration, or as the first
+statement of its body. A `##` run *above* a declaration documents nothing, so the
+block is looked for below it and never above. The lexer has already merged
+consecutive `##` lines into one token and stripped their indentation, which is
+why a two-paragraph block, a `##[` run and a list inside a comment all come out
+as the author wrote them without this side having to know about any of those
+shapes. A `#` comment is not a doc comment: the lexer never makes it a token, so
+it cannot be mistaken for one.
 
 Recording is opt-in (`Parser.keepComments`) and only the editor sets it. The
 grammar's `comment[ COMMENT ]` slot looks like the place for the text and is not:

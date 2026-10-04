@@ -178,8 +178,12 @@ proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
       value.add "\n\n```nim\n" & docs & "\n```"
     else:
       value.add "\n\n" & docs
+  # The cursor is not on a syntax node -- a member name, say -- so the range
+  # falls back to the declaration's, which is what the editor should underline
+  # anyway: it is the thing being described.
+  let hoverRange = if nodeId >= 0: doc.nodes[nodeId].range else: decl.range
   "{\"contents\":{\"kind\":\"markdown\",\"value\":" & quoteJson(value) &
-    "},\"range\":" & rangeJson(doc.nodes[nodeId].range) & "}"
+    "},\"range\":" & rangeJson(hoverRange) & "}"
 
 proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot): string =
   if doc.isMemberAccess(line, character):
@@ -287,10 +291,13 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
     if doc != nil:
       let pos = docPosition(params)
       let nodeId = doc.nodeAt(pos.line, pos.character)
-      let query = if nodeId >= 0:
-          db.ideQueryAt(doc, pos.line, pos.character)
-        else:
-          SemanticSnapshot()
+      # The snapshot answers from recorded occurrences, which is a different
+      # index from the syntax nodes and covers the member name in `node.isEmpty`
+      # too -- there the syntax side has no node under the cursor, because the
+      # name is only reachable through the `dot`. Asking it first and tying the
+      # query to a node id threw away every semantic answer for exactly those
+      # positions, which is most call sites in practice.
+      let query = db.ideQueryAt(doc, pos.line, pos.character)
       case methodName
       of "textDocument/completion": value = completionJson(doc, pos.line, pos.character, query)
       of "textDocument/hover": value = hoverJson(doc, nodeId, query)

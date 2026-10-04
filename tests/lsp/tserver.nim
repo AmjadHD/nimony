@@ -61,7 +61,7 @@ proc runTests() {.raises.} =
     discard handle(db, bad)
 
   let docUri = "file:///workspace/lsp-docs.nim"
-  let openedDocs = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim","languageId":"nim","version":1,"text":"## Doubles x.\n##\n## Second line.\nproc double*(x: int): int =\n  x * 2\n\nproc use() =\n  discard double(2)\n"}}}""")
+  let openedDocs = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim","languageId":"nim","version":1,"text":"proc double*(x: int): int =\n  ## Doubles x.\n  ##\n  ## Second line.\n  x * 2\n\nproc use() =\n  discard double(2)\n"}}}""")
   let docsHover = handle(db, """{"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim"},"position":{"line":7,"character":12}}}""")
   assert docsHover.response.contains("proc double")
   assert docsHover.response.contains("Doubles x.")
@@ -198,26 +198,24 @@ proc runTests() {.raises.} =
          docFixtureOpened.notification
   let docFixtureComments = docFixtureDoc.docComments
   # The module header, the one documented field, `simple`, `twoParagraphs`,
-  # `blockDoc` and the comment inside `usesBodyDoc`'s body. Nothing else: the
-  # `#` comments and `undocumented`, `usesBodyDoc` and `nested` have none.
-  assert docFixtureComments.len == 6,
-         "recorded " & $docFixtureComments.len & " doc comments, expected 6"
+  # `blockDoc`, `usesBodyDoc` and the trailing block after `inlineDoc`'s body.
+  # Nothing else: the `#` comments and `undocumented` and `nested` have none.
+  assert docFixtureComments.len == 7,
+         "recorded " & $docFixtureComments.len & " doc comments, expected 7"
   # A `#` comment is not a doc comment, and the two-paragraph and `##[` blocks
   # keep the blank line and the shape the author wrote.
-  assert docFixtureComments.getOrDefault(8, "").len == 0
-  assert docFixtureComments.getOrDefault(20, "").contains("- one")
-  assert docFixtureComments.getOrDefault(25, "").contains("It spans lines")
-  # A `##` inside a body documents the next declaration in that body, which is
-  # what makes the line-above rule correct rather than merely convenient.
-  assert docFixtureComments.getOrDefault(34, "") ==
-    "Documents the declaration below, not this one."
+  assert docFixtureComments.getOrDefault(9, "").len == 0
+  assert docFixtureComments.getOrDefault(22, "").contains("- one")
+  assert docFixtureComments.getOrDefault(27, "").contains("It spans lines")
+  assert docFixtureComments.getOrDefault(35, "") ==
+    "Documents this declaration, not the next one."
   assert docFixtureComments.getOrDefault(2, "").contains("Second line of it.")
-  assert docFixtureComments.getOrDefault(11, "") == "A simple one-line doc."
-  assert docFixtureComments.getOrDefault(6, "").contains("field's own documentation")
-  # `undocumented` sits under a `#` comment (line 29) and `usesBodyDoc` under
-  # nothing (line 33), so neither line is a key.
-  assert not docFixtureComments.hasKey(29)
-  assert not docFixtureComments.hasKey(33)
+  assert docFixtureComments.getOrDefault(13, "") == "A simple one-line doc."
+  assert docFixtureComments.getOrDefault(7, "").contains("field's own documentation")
+  # `undocumented` sits under a `#` comment (line 30) and `nested` under
+  # nothing (line 40), so neither line is a key.
+  assert not docFixtureComments.hasKey(30)
+  assert not docFixtureComments.hasKey(40)
 
   let dd = db.document(docFixtureUri)
   let simpleHover = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"textDocument/hover\"," &
@@ -225,6 +223,15 @@ proc runTests() {.raises.} =
     "\"},\"position\":{\"line\":11,\"character\":7}}}")
   assert simpleHover.response.contains("A simple one-line doc."),
          "hover lost the doc comment: " & simpleHover.response
+  # A `##` block is the documentation of the declaration it follows as the first
+  # statement of the body's, and of nothing else. `usesBodyDoc`'s block sits
+  # under `usesBodyDoc` and above `nested`, so it belongs to `usesBodyDoc` and
+  # `nested` must stay undocumented.
+  let nestedHover = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"textDocument/hover\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & docFixtureUri &
+    "\"},\"position\":{\"line\":39,\"character\":7}}}")
+  assert not nestedHover.response.contains("Documents this declaration"),
+         "a later declaration took the block above it: " & nestedHover.response
 
 try:
   runTests()

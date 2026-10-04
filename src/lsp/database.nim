@@ -479,6 +479,32 @@ proc resolve*(doc: Document; nodeId: int): seq[int] =
       nearestDepth = depth
     if depth == nearestDepth: result.add candidate.id
 
+proc docBlockFirstLine(text: string; lastLine: int): int =
+  ## The line a recorded `##` block STARTS on, given the line it ends on.
+  ##
+  ## The parser keys the table by a block's last line and keeps the merged token
+  ## text, whose newlines are exactly the block's interior lines -- so the first
+  ## line is the key minus those newlines. Deriving it here rather than keeping a
+  ## second table means the two can never disagree.
+  var first = lastLine
+  for ch in text:
+    if ch == '\n': dec first
+  first
+
+proc docLineBody(line: string): tuple[isDoc: bool, body: string] =
+  ## A line's doc-comment text, with the `##` and one following space removed.
+  ##
+  ## A bare `##` is a doc line with empty text -- that is the blank line between
+  ## paragraphs -- so `isDoc` says whether the line is part of a block at all,
+  ## which `body.len > 0` cannot.
+  var i = 0
+  while i < line.len and line[i] in {' ', '\t'}: inc i
+  if i + 1 >= line.len or line[i] != '#' or line[i + 1] != '#':
+    return (false, "")
+  result = (true, line[i + 2 .. ^1])
+  if result.body.len > 0 and result.body[0] == ' ':
+    result.body = result.body[1 .. ^1]
+
 proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
                    name: string): string =
   ## The `##` block documenting a declaration.
@@ -486,9 +512,17 @@ proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
   ## For the open document the text is what the parser recorded, which is exact:
   ## it is the block the lexer actually merged, so a `##[` run, a blank `##` line
   ## between paragraphs and leading indentation all come out right without this
-  ## function having to know about any of them. A declaration is documented
-  ## exactly when the line above it is where its block ended; `lineNo` arrives
-  ## 1-based from some call sites and 0-based from others, so both are tried.
+  ## function having to know about any of them.
+  ##
+  ## A Nim doc comment is written *after* the thing it documents: either inline
+  ## at the end of the declaration, or as the first statement of its body. A `##`
+  ## run above a declaration documents nothing, so the block is looked for
+  ## directly below the declaration and never above it. Assuming otherwise is
+  ## what made hover report every documented proc in this tree -- where the
+  ## convention is overwhelmingly the in-body one -- as undocumented.
+  ##
+  ## `lineNo` arrives 1-based from some call sites and 0-based from others, so
+  ## the line below it is looked for under both readings.
   ##
   ## For any *other* file the tree has nothing -- it only holds the open
   ## document -- so the text is scanned lexically there, exactly as before. That
@@ -496,47 +530,40 @@ proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
   ## copy for another open-but-unsaved buffer, and it cannot see a `##[` block.
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
   if path == doc.path:
-    for line in [lineNo - 2, lineNo - 1]:
-      let found = doc.docComments.getOrDefault(line, "")
-      if found.len > 0: return found
+    # The table is keyed by a block's LAST line, so the block that documents
+    # this declaration is the one *starting* below it. Its first line is its key
+    # minus its interior newlines, which the merged text already carries.
+    for line in [lineNo, lineNo + 1]:
+      for key, text in doc.docComments:
+        if text.len > 0 and docBlockFirstLine(text, key) == line:
+          return text
   var text = ""
   if path == doc.path: text = doc.text
   else:
     try: text = readFile(path)
     except: discard
   if text.len == 0: return ""
-  var lines: seq[string] = @[]
-  var start = 0
-  var current = 1
-  while current < lineNo and start < text.len:
-    if text[start] == '\n': inc current
-    inc start
-  var stop = start
-  while stop < text.len and text[stop] != '\n': inc stop
-  var scan = start
+  # Another file's text, so the block is found by scanning down from the
+  # declaration, the same direction the table lookup above uses. A signature
+  # that wraps over several lines is skipped by bracket depth, so the block is
+  # still found under the first statement of the body.
+  let lines = text.splitLines()
+  var index = max(0, min(lineNo - 1, lines.len - 1))
+  var depth = 0
+  while index < lines.len:
+    for ch in lines[index]:
+      if ch in {'(', '[', '{'}: inc depth
+      elif ch in {')', ']', '}'}: dec depth
+    inc index
+    if depth > 0: continue
+    break
   var collected: seq[string] = @[]
-  while scan > 0:
-    dec scan
-    if text[scan] == '\n': continue
-    var lineEnd = scan + 1
-    while lineEnd < text.len and text[lineEnd] != '\n': inc lineEnd
-    var lineStart = lineEnd
-    while lineStart > 0 and text[lineStart - 1] != '\n': dec lineStart
-    var firstNonSpace = lineStart
-    while firstNonSpace < lineEnd and text[firstNonSpace] in {' ', '\t'}:
-      inc firstNonSpace
-    if firstNonSpace + 1 < lineEnd and text[firstNonSpace] == '#' and
-        text[firstNonSpace + 1] == '#':
-      var body = text[firstNonSpace + 2 ..< lineEnd]
-      if body.len > 0 and body[0] == ' ': body = body[1 .. ^1]
-      collected.add body
-      scan = lineStart
-    else:
-      break
-  if collected.len == 0: return ""
-  for i in countdown(collected.high, 0):
-    lines.add collected[i]
-  lines.join("\n")
+  while index < lines.len:
+    let line = docLineBody(lines[index])
+    if not line.isDoc: break
+    collected.add line.body
+    inc index
+  collected.join("\n")
 
 proc positionOffset(doc: Document; line, character: int): int =
   result = 0

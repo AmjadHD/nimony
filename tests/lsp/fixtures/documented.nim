@@ -3,27 +3,28 @@
 
 type
   Thing* = object
-    ## The field's own documentation.
     name*: string
-    # A plain hash is not documentation.
+    ## The field's own documentation.
     size*: int
+    # A plain hash is not documentation.
+    other*: int
 
-## A simple one-line doc.
 proc simple*(): int =
+  ## A simple one-line doc.
   1
 
-## First paragraph of a two-paragraph doc.
-##
-## Second paragraph, with `code` and a list:
-##
-## - one
-## - two
 proc twoParagraphs*(): int =
+  ## First paragraph of a two-paragraph doc.
+  ##
+  ## Second paragraph, with `code` and a list:
+  ##
+  ## - one
+  ## - two
   2
 
-##[ A block comment.
-    It spans lines and keeps its shape. ]##
 proc blockDoc*(): int =
+  ##[ A block comment.
+      It spans lines and keeps its shape. ]##
   3
 
 # an ordinary comment, not documentation
@@ -31,10 +32,14 @@ proc undocumented*(): int =
   4
 
 proc usesBodyDoc*(x: int): int =
-  ## Documents the declaration below, not this one.
+  ## Documents this declaration, not the next one.
   discard x
   nested*()
   5
 
 proc nested*(): int =
   6
+
+proc inlineDoc*(): int = 4
+  ## Not a doc comment for `inlineDoc`: it follows the body, and only a block
+  ## that is the first statement of a body documents the declaration.
