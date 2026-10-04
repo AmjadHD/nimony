@@ -163,6 +163,15 @@ proc runTests() {.raises.} =
   let sibHover = handle(db, """{"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
   assert sibHover.response.contains("siblingAnswer"),
          "no hover for the sibling's symbol: " & sibHover.response
+  # The helper is not the open document, so its text is read from disk and the
+  # block is read with the lexer. Its doc comment is a `##[` run, and the
+  # assertion names a phrase from the *last* line of it: a scan that only
+  # recognises lines beginning with `##` stops at the opening line and loses the
+  # rest, which is the whole gap this covers.
+  assert sibHover.response.contains("keep supplying"),
+         "cross-file hover lost a `##[` block comment: " & sibHover.response
+  assert sibHover.response.contains("A documented answer"),
+         "cross-file hover lost the block's first line: " & sibHover.response
 
   let sibDef = handle(db, """{"jsonrpc":"2.0","id":91,"method":"textDocument/definition","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
   assert sibDef.response.contains("sibling_dep_helper.nim"),

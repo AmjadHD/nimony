@@ -4,7 +4,7 @@
 {.feature: "lenientnils".}
 
 import std / [tables, strutils, os, hashes, dirs, paths, syncio, osproc]
-import ../nifler2 / [nimgrammar, parserrt]
+import ../nifler2 / [nimgrammar, nimlexer, parserrt]
 import ../nifler2 / niflerout
 import ../lib / comesfrom
 import ../gear2 / modnames
@@ -503,19 +503,28 @@ proc docBlockFirstLine(text: string; lastLine: int): int =
     if ch == '\n': dec first
   first
 
-proc docLineBody(line: string): tuple[isDoc: bool, body: string] =
-  ## A line's doc-comment text, with the `##` and one following space removed.
+proc docCommentStartingAt(text: string; startLine: int): string =
+  ## The `##` block beginning on 1-based `startLine`, or `""`.
   ##
-  ## A bare `##` is a doc line with empty text -- that is the blank line between
-  ## paragraphs -- so `isDoc` says whether the line is part of a block at all,
-  ## which `body.len > 0` cannot.
-  var i = 0
-  while i < line.len and line[i] in {' ', '\t'}: inc i
-  if i + 1 >= line.len or line[i] != '#' or line[i + 1] != '#':
-    return (false, "")
-  result = (true, line[i + 2 .. ^1])
-  if result.body.len > 0 and result.body[0] == ' ':
-    result.body = result.body[1 .. ^1]
+  ## Read with the project's own lexer, which is what makes the two paths agree.
+  ## The open document's text is that lexer's merged token, so a `##[` run, a
+  ## blank `##` between paragraphs and the author's indentation come out here
+  ## exactly as they do there. The previous line scan could only recognise a
+  ## line beginning with `##`, so a block comment contributed just its opening
+  ## line and the rest was lost -- and matching that by hand is how the two paths
+  ## drift in the first place.
+  ##
+  ## `openLexer` interns nothing into the symbol pool, so this is safe to call per
+  ## query. It is one pass over text the caller has already read from disk.
+  var lex = openLexer(text)
+  var tok = Token(kind: tkInvalid, s: "", indent: -1, spacing: {},
+                 line: 0, col: 0, base: 10, suffixPos: -1)
+  next lex, tok
+  while tok.kind != tkEof:
+    if tok.kind == tkComment and int(tok.line) == startLine:
+      return tok.s
+    next lex, tok
+  ""
 
 proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
                    name: string): string =
@@ -569,13 +578,7 @@ proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
     inc index
     if depth > 0: continue
     break
-  var collected: seq[string] = @[]
-  while index < lines.len:
-    let line = docLineBody(lines[index])
-    if not line.isDoc: break
-    collected.add line.body
-    inc index
-  collected.join("\n")
+  docCommentStartingAt(text, index + 1)
 
 proc positionOffset(doc: Document; line, character: int): int =
   result = 0
