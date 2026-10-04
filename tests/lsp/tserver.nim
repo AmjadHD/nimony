@@ -224,6 +224,46 @@ proc runTests() {.raises.} =
   assert simpleHover.response.contains("A simple one-line doc."),
          "hover lost the doc comment: " & simpleHover.response
 
+  # When a name resolves through overload resolution sem reports two records for
+  # the one span: the overload set it weighed, and the single symbol it picked --
+  # and the set is written first. Answering from the first match therefore
+  # described the wrong proc. `result.add` on a `string` is the sharp case:
+  # `seqimpl.add` and `stringimpl.add` both match the name, sem resolves to
+  # `stringimpl`, and the set's first element is `seqimpl`.
+  let overloadText = "proc useOverload*(s: string) =\n  s.add('x')\n"
+  let overloadUri = "file:///workspace/lsp-overload.nim"
+  let overloadOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-overload.nim","languageId":"nim","version":1,"text":"proc useOverload*(s: string) =\n  s.add('x')\n"}}}""")
+  assert not overloadOpened.notification.contains("semantic analysis failed"),
+         "the overload fixture failed to compile: " & overloadOpened.notification
+  let overloadDoc = db.document(overloadUri)
+  assert overloadDoc != nil and overloadDoc.snapshot.positions.len > 0,
+         "the overload fixture recorded no occurrences"
+  # The occurrence is recorded twice, and the two records disagree -- that is the
+  # premise. The pair is found rather than hardcoded, so the test does not depend
+  # on where `seqimpl` and `stringimpl` happen to live.
+  var overloadSet = IdePosition(line: -1, column: -1)
+  var overloadPick = IdePosition(line: -1, column: -1)
+  for position in overloadDoc.snapshot.positions:
+    if position.name != "add": continue
+    if position.symbols.len == 1: overloadPick = position
+    elif position.symbols.len > 1: overloadSet = position
+  assert overloadSet.symbols.len > 1 and overloadPick.symbols.len == 1,
+         "expected `add` to be recorded as an overload set and as a resolution"
+  assert overloadSet.symbols[0].range.startLine != overloadPick.symbols[0].range.startLine,
+         "the set's first candidate and the resolved symbol are the same here, " &
+         "so this fixture no longer exercises the ordering"
+  let addHover = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"textDocument/hover\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & overloadUri &
+    "\"},\"position\":{\"line\":1,\"character\":4}}}")
+  # Hover must answer from the resolution. Its range is the only place the chosen
+  # declaration shows, so that is what the assertion reads.
+  assert addHover.response.contains("\"line\":" & $overloadPick.symbols[0].range.startLine),
+         "hover did not answer from the resolved symbol: " & addHover.response
+  assert not addHover.response.contains("\"line\":" & $overloadSet.symbols[0].range.startLine),
+         "hover answered from the overload set's first candidate: " &
+         addHover.response
+  discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-overload.nim"}}}""")
+
   # A document sem has already checked but which recorded no occurrences -- an
   # empty buffer, or one holding only comments -- must not be compiled again per
   # query. Document mode records every occurrence in the file, so zero positions

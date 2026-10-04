@@ -27,7 +27,19 @@ source line, so instead of matching one cursor it records, in a single sem pass:
 - the semantic errors (`error` rows).
 
 The editor indexes the occurrences by position, so hover and go-to-definition
-are table lookups. Measured over stdio on a document importing five stdlib
+are table lookups.
+
+One span can carry two records. When a name resolved through overload
+resolution, sem reports both the overload set it weighed and the single symbol
+it picked, and the set is written first. Answering from the first match
+therefore described the wrong proc: `result.add` on a `string` resolved to
+`stringimpl.add`, but the set's first element is `seqimpl.add`, so hover
+answered with that -- and quoted its documentation, which describes growing
+storage. A record with one candidate is a resolution and outranks an overload
+set, whatever column it sits at. Measured over `handlers.nim`, 33 spans were
+answered from the set's first element before this, and none after.
+
+Measured over stdio on a document importing five stdlib
 modules (Termux, 8 cores):
 
 | operation | before | after |

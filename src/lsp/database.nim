@@ -325,16 +325,28 @@ proc document*(db: Database; uri: string): Document {.raises.} =
 proc positionAt*(snapshot: SemanticSnapshot; line, character: int): IdePosition {.raises.} =
   ## The occurrence the cursor is inside, if any. An identifier can be several
   ## columns wide, so the match is by span and not by the exact start column.
+  ##
+  ## One span can carry two records. When a name resolved through overload
+  ## resolution, sem reports both the overload set it weighed and the single
+  ## symbol it picked -- and the set comes first, so taking the first match
+  ## returned the set's first element rather than the answer. For `result.add`
+  ## on a `string` that is `seqimpl.add` instead of `stringimpl.add`, so hover
+  ## described the wrong proc and quoted the wrong comment. A record with one
+  ## candidate is a resolution and outranks an overload set, whatever the column.
   result = IdePosition(line: -1, column: -1)
-  var best = high(int)
+  var bestRank = 0
+  var bestDistance = high(int)
   for position in snapshot.positions:
     if position.line != line + 1: continue
     let width = position.name.len
     if character < position.column or character >= position.column + width: continue
     let distance = character - position.column
-    if distance < best:
-      best = distance
-      result = position
+    let rank = if position.symbols.len == 1: 2 elif position.symbols.len > 1: 1 else: 0
+    if rank < bestRank: continue
+    if rank == bestRank and distance >= bestDistance: continue
+    bestRank = rank
+    bestDistance = distance
+    result = position
   result
 
 proc unescapeTsv(s: string): string =
