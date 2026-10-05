@@ -737,7 +737,21 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
       let source = if fields[3].len > 0: realFile(fields[3]) else: ""
       let isLocal = fields[6] == "true"
       if isLocal or source == doc.path:
-        for id in doc.resolveNameAt(fields[1], queryLine, queryCharacter):
+        let resolved = doc.resolveNameAt(fields[1], queryLine, queryCharacter)
+        if resolved.len == 0:
+          # The syntax index has no node for this name, which is the normal case
+          # for a type's members: an enum field is not a statement the parser
+          # records a declaration for. The row already carries the declaration's
+          # own file, line and column, so use those rather than dropping it --
+          # dropping is what made post-dot completion answer nothing at all.
+          let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
+            uri: doc.uriForPath(source),
+            range: doc.sourceRange(source, lineNo, column, fields[1]),
+            doc: doc.docCommentAt(source, lineNo, column, fields[1]))
+          if fields[0] == "visible": result.visible.add symbol
+          else: result.candidates.add symbol
+          continue
+        for id in resolved:
           let n = doc.nodes[id]
           let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
             uri: doc.uri, range: n.range,
@@ -762,8 +776,22 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSna
   ## The answer for a cursor position. When the document was checked in document
   ## mode this is a lookup in the recorded positions and spawns nothing; the
   ## per-position compile is the fallback for a document sem has not run on.
-  if doc.snapshot.positions.len > 0:
-    let position = doc.snapshot.positionAt(line, character)
+  ##
+  ## A cursor sitting on a dot with *nothing typed after it* is the one position
+  ## that must skip the snapshot even when one exists. There is no identifier
+  ## occurrence recorded for it to find, and the answer -- the receiver's members
+  ## -- depends on the receiver's *type*, which only a cursor query computes. The
+  ## recorded import table cannot stand in for it.
+  ##
+  ## The test is "no name here", not "there is a dot here". A member name that
+  ## *has* been typed, `s.add`, is also preceded by a dot but is an ordinary
+  ## recorded occurrence, and answering it from a cursor query would throw away
+  ## the resolution -- which is the wrong symbol whenever the name is overloaded.
+  let position = if doc.snapshot.positions.len > 0
+                   : doc.snapshot.positionAt(line, character)
+                 else: IdePosition(line: -1, column: -1)
+  let emptyDot = doc.isMemberAccess(line, character) and position.symbols.len == 0
+  if doc.snapshot.positions.len > 0 and not emptyDot:
     result = SemanticSnapshot(queried: true, matched: position.symbols.len > 0,
                               documentMode: true, visible: @[],
                               candidates: position.symbols,
@@ -779,7 +807,7 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSna
   # which is what an editor creates one of per session -- paid a full compile on
   # every keystroke, and a large file whose compile failed outright, leaving no
   # sidecar to record anything, paid one per hover across its whole import graph.
-  if doc.snapshot.queried:
+  if doc.snapshot.queried and not emptyDot:
     return SemanticSnapshot(queried: true, matched: false,
                             visible: @[], candidates: @[])
   if doc.queryCached and doc.queryLine == line and doc.queryCharacter == character:

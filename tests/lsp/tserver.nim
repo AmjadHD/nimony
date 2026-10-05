@@ -273,6 +273,39 @@ proc runTests() {.raises.} =
          addHover.response
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-overload.nim"}}}""")
 
+  # Completion after a dot, from the receiver's established type. This is the
+  # first of Phase 2v2's criteria that needs no overload resolution at all: the
+  # receiver's type is already known, so walking its members is the whole job.
+  #
+  # It has to be a *cursor* query. Nothing is typed after the dot, so the
+  # document-mode occurrence walk has no symbol to record for the position, and
+  # the import table lists every name in sight rather than this type's members --
+  # so the snapshot cannot answer it even when it exists.
+  let dotText = "type Color = enum\n  colRed, colGreen, colBlue\n\n" &
+                "proc partial(k: Color) =\n  k.\n"
+  let dotUri = "file:///workspace/lsp-dot.nim"
+  let dotOpened = handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & dotUri &
+    "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
+    dotText.replace("\n", "\\n") & "\"}}}")
+  assert not dotOpened.notification.contains("semantic analysis failed"),
+         "the dot fixture failed to compile: " & dotOpened.notification
+  # `k.` on 0-based line 4, cursor right after the dot, at end of file -- the shape
+  # a user is actually in while typing.
+  let enumComplete = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"textDocument/completion\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & dotUri &
+    "\"},\"position\":{\"line\":4,\"character\":4}}}")
+  for want in ["colRed", "colGreen", "colBlue"]:
+    assert enumComplete.response.contains(want),
+           "post-dot completion on an enum omitted " & want & ": " &
+           enumComplete.response
+  # A name that is not a member of `Color` must not appear, or this is just the
+  # scope chain again under a different label.
+  assert not enumComplete.response.contains("\"label\":\"partial\""),
+         "post-dot completion offered a name from outside the receiver's type: " &
+         enumComplete.response
+  discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot.nim"}}}""")
+
   # A document sem has already checked but which recorded no occurrences -- an
   # empty buffer, or one holding only comments -- must not be compiled again per
   # query. Document mode records every occurrence in the file, so zero positions

@@ -1317,6 +1317,60 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
   if result == MatchedDotField:
     commonType c, dest, it, exprStart, expected
 
+proc enumerationMembers(typ: Cursor): seq[SymId] =
+  ## An enum type's fields, in declaration order.
+  ##
+  ## Deliberately narrow. `findObjFieldConsiderVis` looks a field up by name for
+  ## a `dot` that already has one, and there is no counterpart that lists an
+  ## object's members, so this covers the case that needs no such traversal: an
+  ## enum's fields hang directly off the type's body as `EfldY` symbols. Anything
+  ## else yields nothing, which is 2v1's existing answer for a receiver it cannot
+  ## describe -- an empty completion list is the documented degradation, not a
+  ## wrong one.
+  result = @[]
+  if not typ.isSymbol: return
+  let section = getTypeSection(typ.symId)
+  if section.kind != TypeY: return
+  let body = section.body
+  if body.typeKind notin {EnumT, HoleyEnumT, AnumT}: return
+  var n = body.childCursor
+  while n.hasMore:
+    if n.isSymbol or n.isSymbolDef:
+      let res = tryLoadSym(n.symId)
+      if res.status == LacksNothing and res.decl.symKind == EfldY:
+        result.add n.symId
+    inc n
+
+proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
+                       fieldNameCursor: Cursor; info: NifLineInfo) =
+  ## Record the members of a completed dot's receiver, for a completion request
+  ## sitting on the dot with nothing typed after it.
+  ##
+  ## A cursor query, not a document one: the occurrence walk has no symbol to
+  ## record when no name has been typed yet, and a dot's members depend on the
+  ## receiver's type, so they cannot come from the import table either. This is
+  ## what the per-position fallback is actually for.
+  if not c.ideQuery.enabled or c.ideQuery.documentMode: return
+  # Only when no name follows the dot. The recovering parser leaves an `(err ...)`
+  # node there rather than a bare dot token, so "a symbol is present" is the test
+  # for "the user has typed something" -- the same condition `tryBuiltinDot` reads
+  # as `fieldName == StrId(0)`. With a name present the tree carries an ordinary
+  # identifier occurrence and the ordinary cursor query answers it.
+  if fieldNameCursor.isSymbol: return
+  let query = c.ideQuery.info
+  if not query.isValid: return
+  # The cursor must be on this dot, at or after it: an earlier `dot` on the same
+  # line must not capture the request.
+  if query.line != int(info.line) or query.col < int(info.col): return
+  var root = skipModifier(lhs.typ)
+  if root.typeKind in {RefT, PtrT}: inc root
+  discard skipInvoke(root)
+  for sym in enumerationMembers(root):
+    var ide = c.ideSymbol(dest, sym)
+    ide.kind = EfldY
+    c.ideQuery.visible.add ide
+  if c.ideQuery.visible.len > 0: c.ideQuery.matched = true
+
 proc semDot(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemFlag]) =
   let exprStart = dest.len
   let info = it.n.info
@@ -1330,6 +1384,9 @@ proc semDot(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemF
   it.n = lhs.n
   lhs.n = cursorAt(lhsBuf, 0)
   let fieldNameCursor = it.n
+  # Before anything is emitted for the dot: the receiver's type is
+  # established here, and a completion request on the dot needs it.
+  captureDotMembers c, dest, lhs, fieldNameCursor, info
   let fieldName = takeIdent(it.n)
   # skip optional inheritance depth:
   if it.n.isIntLit:

@@ -186,11 +186,26 @@ proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
     "},\"range\":" & rangeJson(hoverRange) & "}"
 
 proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot): string =
-  if doc.isMemberAccess(line, character):
-    return "{\"isIncomplete\":false,\"items\":[]}"
   result = "{\"isIncomplete\":false,\"items\":["
   var labels = initHashSet[string]()
   var first = true
+  if doc.isMemberAccess(line, character):
+    # A dot: what can follow it is the receiver's members, which sem records from
+    # the receiver's established type. The scope chain and the import table are
+    # the wrong answer here -- they list every name in sight, not this type's --
+    # so only the cursor query's rows are offered.
+    for symbol in query.visible:
+      let name = symbol.name
+      if name.len == 0 or name in labels: continue
+      labels.incl name
+      if not first: result.add ','
+      first = false
+      let kind = if symbol.kind in ["proc", "func", "iterator", "method",
+                                    "template", "macro", "converter"]: 3 else: 20
+      result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
+        ",\"detail\":" & quoteJson(symbol.kind) & "}"
+    result.add ']'
+    return
   if query.documentMode:
     # Document mode records the module's import table once instead of the scope
     # chain at a cursor, so offer those names and let the lexical index supply
