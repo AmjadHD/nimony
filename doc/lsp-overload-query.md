@@ -136,10 +136,61 @@ should be factored out so that:
 - the new path adds the third verdict and the "every binding" rule, in new code
   that *calls* the shared rules rather than restating them.
 
-That is the only safe way to touch `sigmatch` here. Widening `typematch` to return
-three values would change what the batch path does with a mismatch unless every
-existing caller is audited; keeping the batch entry point untouched and adding a
-sibling is auditable in a way that changing it is not.
+Widening `typematch` to return three values would change what the batch path does
+with a mismatch unless every existing caller is audited; keeping the batch entry
+point untouched and adding a sibling is auditable in a way that changing it is not.
+
+### What is already exposed, by name
+
+A general promise to "factor out" is worth nothing, so concretely:
+
+| what | where | note |
+| --- | --- | --- |
+| `sigmatch(m, fn, args, explicitTypeVars)` | `sigmatch.nim:2881` | the batch entry point; stays untouched |
+| `typematch(m, formal, arg: Item)` | `sigmatch.nim:2627` | the per-pair decision; the natural place for a third verdict |
+| `classifyMatch(m): TypeRelation` | `sigmatch.nim:2645` | already a *graded* relation, not a boolean |
+| `Match.inferred` / `Match.unboundTvars` | `sigmatch.nim:64` | the binding set and the count of what is still unbound |
+| `bindTypevar(m, fs, a)` | `sigmatch.nim:115` | the only mutator; decrements the count |
+| `anArgIsStillUntyped(args)` | `sigmatch.nim:2871` | **already the (b) rule**, narrowly |
+
+Two of these deserve emphasis, because they make the job smaller than a first
+reading suggests.
+
+`classifyMatch` already returns a graded `TypeRelation` (`NoMatch`, `EqualMatch`,
+`GenericMatch`, …), not a boolean. The three-valued verdict is closer to the
+existing shape than a two-valued one would be.
+
+And `anArgIsStillUntyped` is, in its own words, already this design:
+
+> "`auto` on an argument is not a type, it is 'not decided yet' […] A typevar the
+> arguments left unbound is then unbound because the ARGUMENT is unfinished, not
+> because the candidate is uninstantiable — so the rejection below has nothing to
+> say about it."
+
+sigmatch therefore **already tolerates partial input**, for `AutoT`. It declines to
+reject a candidate whose typevars are unbound *because an argument was unfinished*
+rather than uninstantiable. `unboundTvars` is already the dependency signal the
+rule above is about — a count of what the arguments did not decide.
+
+So the honest scope is not "refactor sigmatch's internals to accept partial
+input". It is:
+
+1. **widen `anArgIsStillUntyped`** from `AutoT` alone to the full unknown set — no
+   resolved symbol, no established type cursor, `UntypedT`, or an `(err)` node in
+   argument position; and
+2. **expose the per-pair decision** so the 2v2 path can read a three-valued verdict
+   instead of the whole-call boolean, without going through `sigmatch` and so
+   without its error accumulation.
+
+(1) is the one with a hidden dependency worth stating: the predicate takes
+`openArray[CallArg]` and today sees only `typ`. Whether an argument came from an
+`(err)` node is not visible to it. `CallArg.orig` exists but is documented as
+"used for untyped args", so widening this needs that field (or a flag) to carry
+the fact — which is a change to how `CallArg` is built at `semcall.nim:1621` and
+`:1664`, not only to the predicate.
+
+That is the one place where "expose a few helpers" understates the work, and it is
+worth knowing before starting rather than after.
 
 ## Arity
 
@@ -160,18 +211,34 @@ failure mode (b) exists to avoid.
 Not all three of the phase's criteria need the range query, and shipping them
 together would put the most speculative piece first.
 
-1. **Post-dot completion from a known receiver.** The fourth row above shows the
+1. **Post-dot completion from a known receiver.** The fourth shape above shows the
    receiver is frequently fully typed while the member name is absent — `h.` with
    `h: Holder`. This is a type query on one expression, not a range query over
-   arguments. It is the most visible, and the smallest in scope — but not already
-   done: `buildSymChoiceForDot` (`sembasics.nim:57`) is marked *"not used yet"* and
-   only sweeps the scope for same-named routines, which is the name-based
-   approach 2v1 already has, not the type-directed one this needs. The seam is
-   marked; the work behind it is not done.
+   arguments. It is not already built: `buildSymChoiceForDot` (`sembasics.nim:57`)
+   is marked *"not used yet"* and only sweeps the scope for same-named routines,
+   which is the name-based approach 2v1 already has, not the type-directed one
+   this needs.
+
+   **The honest caveat on calling this the cheap one.** It is cheap *relative to
+   mid-call completion*, and it stays cheap under exactly one condition: the
+   receiver's type is already established. If the receiver came from a generic
+   call whose typevars are unbound, its type is genuinely unknown, and the correct
+   answer is **no result** — 2v1's existing stance — not a fallback into the
+   dependency machinery. So the case that would pull (b)'s dependency tracking into
+   post-dot completion is the case we decline rather than attempt. What remains is
+   a walk of an established type's members, which needs no overload resolution at
+   all.
+
+   That distinction is what makes the ordering safe rather than optimistic: it is
+   a claim about which cases are *excluded*, not an estimate of the included ones.
 2. **Signature help.** Needs the parameter lists of all candidates, filtered by
    (b). No inference, no new resolution logic; it is mostly presentation.
 3. **Mid-call completion** (`foo.bar(x`). The range query itself. Ship last,
    because it is the piece whose value depends on (1) and (2) having been used.
+
+Note that (1) does not need `anArgIsStillUntyped` widened at all, so it does not
+wait on the one piece of plumbing described above. That is a further reason to put
+it first: it is the only criterion with no dependency on the `CallArg` change.
 
 ## What stays out
 
@@ -192,3 +259,24 @@ Scoped to what 2v1 punts on, per the prompt:
   no diagnostics it did not have, and a batch compile of a file that does not
   typecheck must still fail exactly as before. A phase that only adds answers is
   not finished until it has been shown not to take any away.
+
+## Open questions
+
+Recorded rather than answered, because answering them needs code this note is
+written before.
+
+- **Widening `anArgIsStillUntyped` needs `CallArg` to carry more.** The predicate
+  sees only `typ`, so it cannot tell an `AutoT` argument from one that came from an
+  `(err)` node. Either `orig` starts carrying that fact, or a flag does. This
+  touches argument construction at `semcall.nim:1621`/`:1664`, which is the widest
+  blast radius of anything described here.
+- **`unboundTvars` is a whole-call count, not a per-argument one.** (b) needs the
+  dependency per pair — which argument is holding which typevar open. Deriving
+  that from a single counter may mean threading per-typevar provenance through
+  `bindTypevar`, or accepting a coarser approximation for generics and saying so.
+  Whether the coarse version is still sound is not obvious and should be settled
+  before the range query is written, not during.
+- **No signature help exists yet.** `handlers.nim` has completion, hover,
+  go-to-definition and diagnostics; there is no `textDocument/signatureHelp` to
+  extend. It is listed as cheap above because it needs no resolution logic, not
+  because the plumbing exists.
