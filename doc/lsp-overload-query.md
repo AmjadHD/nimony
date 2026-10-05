@@ -262,21 +262,69 @@ Scoped to what 2v1 punts on, per the prompt:
 
 ## Open questions
 
-Recorded rather than answered, because answering them needs code this note is
-written before.
-
-- **Widening `anArgIsStillUntyped` needs `CallArg` to carry more.** The predicate
-  sees only `typ`, so it cannot tell an `AutoT` argument from one that came from an
-  `(err)` node. Either `orig` starts carrying that fact, or a flag does. This
-  touches argument construction at `semcall.nim:1621`/`:1664`, which is the widest
-  blast radius of anything described here.
-- **`unboundTvars` is a whole-call count, not a per-argument one.** (b) needs the
-  dependency per pair — which argument is holding which typevar open. Deriving
-  that from a single counter may mean threading per-typevar provenance through
-  `bindTypevar`, or accepting a coarser approximation for generics and saying so.
-  Whether the coarse version is still sound is not obvious and should be settled
-  before the range query is written, not during.
 - **No signature help exists yet.** `handlers.nim` has completion, hover,
   go-to-definition and diagnostics; there is no `textDocument/signatureHelp` to
   extend. It is listed as cheap above because it needs no resolution logic, not
   because the plumbing exists.
+
+## Resolved: the dependency granularity, and it is not the coupling it looked like
+
+The open question was whether `unboundTvars` can yield *per-pair* provenance or
+only a whole-call count, since (b) needs to know which argument holds which
+typevar open. Checked first, because it decides the shape of the `CallArg` change
+and is much cheaper to read than to write.
+
+**Per-pair granularity is available, and it does not need `CallArg` at all.**
+
+`sigmatchLoop` (`sigmatch.nim:2681`) is the per-argument loop, and at
+`sigmatch.nim:2728`–`2729` it holds both operands at once:
+
+```nim
+m.argInfo = args[i].n.info
+singleArg m, ftyp, args[i]
+```
+
+`i` is the argument index and `ftyp` the formal being matched against it. `m.pos`
+already carries that index — incremented at `:2731`, saved and restored around
+nested calls at `:3109`–`:3129` — so it already answers "which argument am I on"
+inside exactly the scope that needs it.
+
+The data (b) wants is therefore two maps, both fillable at that one site:
+
+- **argument → the typevars its formal mentions.** `ftyp` is in hand at `:2729`.
+  No collector exists — `containsGenericParams` (`typeprops.nim:261`) answers the
+  same question as a bool, via `containsGenericParamsAux` (`:215`) — but that
+  traversal is already written, and a sibling accumulating `SymId`s instead of
+  short-circuiting on `true` is a small addition beside it.
+- **typevar → the argument that bound it.** `bindTypevar` (`:115`) records only
+  `m.inferred[fs] = a` and decrements the count; it returns `void` and keeps no
+  position. But `m.pos` is the owning argument at every call site inside the loop
+  (`:774`, `:1247`, `:1768`), so a parallel map filled beside `m.inferred[fs] = a`
+  is the whole of it.
+
+**Neither touches `CallArg`, `semcall.nim`, or the predicate.** The coupling does
+not exist, so the two changes sequence independently — and the `CallArg` widening,
+which *is* wide (it reaches argument construction at `semcall.nim:1621`/`:1664`),
+can wait without blocking anything above.
+
+Two real costs inside sigmatch, which are not `CallArg` costs:
+
+- **A binding has four sources, not one.** Arguments bind typevars, but so do
+  explicit generic arguments (`:2811`), uninstantiated parameter defaults
+  (`collectDefaultValues`, reached from `:2900`), and the call site's expected
+  return type (`inferTypevarsFromExpected`, `:2869`). Only the first has an owning
+  argument. That is not a workaround — a typevar bound by the expected type is
+  genuinely owned by none — but the map must be able to say "owned by nobody", or
+  (b) will misattribute those to whichever argument happened to be in `m.pos`.
+- **Provenance must survive the restore paths.** `undoInferred` (`:851`) walks a
+  probe's `inferred` and re-binds through `bindTypevar`, and `Match`'s own comment
+  (`:69`) records that concept probing "restores `inferred` wholesale
+  (`inferenceBase`), which can put a typevar back to unbound behind the count's
+  back". A position map not rewound alongside `inferred` goes stale exactly where
+  the count is already known to be approximate, so it needs the same discipline as
+  the count it sits beside, not less.
+
+This also settles how provenance is *used*. The verdict for a pair is still
+computed by the shared compatibility rules; provenance only decides whether that
+verdict is allowed to eliminate, which is the question the rule turns on. So (b)
+does not need its verdicts derived from provenance — only gated by it.
