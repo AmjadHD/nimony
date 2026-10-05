@@ -267,14 +267,17 @@ Scoped to what 2v1 punts on, per the prompt:
   extend. It is listed as cheap above because it needs no resolution logic, not
   because the plumbing exists.
 
-## Resolved: the dependency granularity, and it is not the coupling it looked like
+## Resolved: the dependency granularity, and the rule for its one gap
 
 The open question was whether `unboundTvars` can yield *per-pair* provenance or
 only a whole-call count, since (b) needs to know which argument holds which
 typevar open. Checked first, because it decides the shape of the `CallArg` change
 and is much cheaper to read than to write.
 
-**Per-pair granularity is available, and it does not need `CallArg` at all.**
+**Per-pair granularity is available for the arguments, and it does not need
+`CallArg` at all. It is not available for one class of binding, and (b) as worded
+does not cover that class. Both halves matter, so neither is called "closed"
+here.**
 
 `sigmatchLoop` (`sigmatch.nim:2681`) is the per-argument loop, and at
 `sigmatch.nim:2728`–`2729` it holds both operands at once:
@@ -289,7 +292,8 @@ already carries that index — incremented at `:2731`, saved and restored around
 nested calls at `:3109`–`:3129` — so it already answers "which argument am I on"
 inside exactly the scope that needs it.
 
-The data (b) wants is therefore two maps, both fillable at that one site:
+For argument-derived bindings, then, the data (b) wants is two maps, both fillable
+at that one site:
 
 - **argument → the typevars its formal mentions.** `ftyp` is in hand at `:2729`.
   No collector exists — `containsGenericParams` (`typeprops.nim:261`) answers the
@@ -302,29 +306,73 @@ The data (b) wants is therefore two maps, both fillable at that one site:
   (`:774`, `:1247`, `:1768`), so a parallel map filled beside `m.inferred[fs] = a`
   is the whole of it.
 
-**Neither touches `CallArg`, `semcall.nim`, or the predicate.** The coupling does
-not exist, so the two changes sequence independently — and the `CallArg` widening,
-which *is* wide (it reaches argument construction at `semcall.nim:1621`/`:1664`),
-can wait without blocking anything above.
+Neither touches `CallArg`, `semcall.nim`, or the predicate, so these sequence
+independently of the widening below.
 
-Two real costs inside sigmatch, which are not `CallArg` costs:
+### The ownerless case, and its rule
 
-- **A binding has four sources, not one.** Arguments bind typevars, but so do
-  explicit generic arguments (`:2811`), uninstantiated parameter defaults
-  (`collectDefaultValues`, reached from `:2900`), and the call site's expected
-  return type (`inferTypevarsFromExpected`, `:2869`). Only the first has an owning
-  argument. That is not a workaround — a typevar bound by the expected type is
-  genuinely owned by none — but the map must be able to say "owned by nobody", or
-  (b) will misattribute those to whichever argument happened to be in `m.pos`.
+Of the four sources that can bind a typevar, only one is argument-derived:
+
+| source | owner | raises a dependency question? |
+| --- | --- | --- |
+| an argument's type | that argument | yes — this is what the maps are for |
+| an explicit generic argument (`:2811`) | none, but the **user wrote it** at the call site | no: it resolves the typevar to something concrete, so the pair is ordinary compatibility |
+| an uninstantiated parameter default (`collectDefaultValues`, from `:2900`) | none | **yes, and (b) does not cover it** |
+| the call site's expected return type (`inferTypevarsFromExpected`, `:2869`) | none | **yes, and (b) does not cover it** |
+
+So it is two sources, not one, and both are inferred rather than written. The
+reviewer's question stands: (b) says *eliminate only on evidence independent of
+the missing type*, but that phrase presumes an argument on the other side of the
+pair. Here there is no argument, so there is no pair for the rule to speak about,
+and "reject only on independent evidence" has no purchase.
+
+**The rule: an ownerless typevar is treated as unbound for elimination purposes,
+so any pair mentioning it is `unknown` and never `incompatible`.**
+
+That is (a)-like — never eliminate — but scoped to this source rather than to all
+typevars, which is the same cost profile (b) already accepts for unknown
+arguments, applied to one more case.
+
+It follows from the direction of (b) rather than being bolted on. (b) eliminates
+only on evidence drawn *from the arguments*. A binding with no argument is by
+definition not argument evidence, so it can never be the independent evidence that
+licenses eliminating some argument's pair. Structurally it is irrelevant to the
+question, and the safe reading is the one that keeps it that way. Equivalently,
+both this and an unknown argument are the same underlying situation — the user has
+not finished writing something — arriving from different directions: an unknown
+argument withholds evidence, an ownerless typevar has none to give.
+
+Two consequences worth stating rather than leaving to implementation:
+
+- **It only ever makes the candidate set larger.** A candidate whose typevar is
+  reachable only from an unfinished default or an unwritten expected type stays
+  alive. That is (b)'s accepted cost, and it is the cost (b) chose over guessing.
+- **Explicit generic arguments are deliberately *not* in this class.** They are
+  ownerless but user-written, so they are evidence of a kind (b) does rely on —
+  concrete, at the call site. Treating them as ownerless would discard real
+  evidence and make `foo[int](unresolved)` worse than useless. The distinction is
+  *written versus inferred*, not *has an argument versus not*.
+
+### Two costs that remain, inside sigmatch
+
 - **Provenance must survive the restore paths.** `undoInferred` (`:851`) walks a
   probe's `inferred` and re-binds through `bindTypevar`, and `Match`'s own comment
   (`:69`) records that concept probing "restores `inferred` wholesale
   (`inferenceBase`), which can put a typevar back to unbound behind the count's
   back". A position map not rewound alongside `inferred` goes stale exactly where
-  the count is already known to be approximate, so it needs the same discipline as
-  the count it sits beside, not less.
+  the count beside it is already known to be approximate, so it needs the same
+  discipline as the count it sits beside, not less.
+- **The provenance map needs an "owned by nobody" state.** Which is what the rule
+  above consumes, and the reason it is stated here rather than discovered later:
+  without it, a default- or expected-type binding is silently attributed to
+  whichever argument happened to be in `m.pos`, and (b) then eliminates on
+  evidence that belongs to something else. `matchGenericExplicitArgs` (`:2817`)
+  makes this concrete rather than theoretical — it runs from `matchTypevars`
+  (`:2838`), which `sigmatch` calls at `:2885`, *before* `sigmatchLoop` at
+  `:2893`, so every explicit generic binding happens with `m.pos` still 0. A
+  provenance map that simply records `m.pos` files all of them under argument 0.
 
 This also settles how provenance is *used*. The verdict for a pair is still
 computed by the shared compatibility rules; provenance only decides whether that
 verdict is allowed to eliminate, which is the question the rule turns on. So (b)
-does not need its verdicts derived from provenance — only gated by it.
+needs its verdicts gated by provenance, not derived from it.
