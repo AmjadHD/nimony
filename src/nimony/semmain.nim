@@ -355,6 +355,13 @@ proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
       "\t" & file & "\t" & $symbol.info.line &
       "\t" & $symbol.info.col & "\t" &
       $(pool.symModule(symbol.id) == c.thisModuleSuffix) & "\n"
+  # A dot's members, under their own tag. `visible` is the whole scope chain, and
+  # both are written when the cursor is on a half-typed member, so a client cannot
+  # separate them if they share a row type.
+  for symbol in c.ideQuery.dotMembers:
+    let file = if symbol.info.file.isValid: pool.filenames[symbol.info.file] else: ""
+    output.add "dotmember\t" & pool.symBasename(symbol.id) & "\t" & $symbol.kind &
+      "\t" & file & "\t" & $symbol.info.line & "\t" & $symbol.info.col & "\n"
   # An editor shows these as diagnostics, and it cannot read the reporter's
   # stdout: they travel in the same sidecar as the query.
   for record in reporters.collectErrors(dest):

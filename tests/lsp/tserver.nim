@@ -12,6 +12,29 @@ proc uriPathForTest(uriText: string): string {.raises.} =
     return rest[1 .. ^1]
   rest
 
+proc assertWellFormed(response, label: string) =
+  ## Every response must be balanced JSON. A substring assertion cannot see this:
+  ## `{"isIncomplete":false,"items":[]}` *contains* `"items":[]` while being one
+  ## brace short, and that is exactly what a member completion returned until the
+  ## array-closing bracket was written without the object-closing one.
+  var depth = 0
+  var inStr = false
+  var i = 0
+  while i < response.len:
+    let ch = response[i]
+    if inStr:
+      if ch == '\\': inc i
+      elif ch == '"': inStr = false
+    else:
+      case ch
+      of '"': inStr = true
+      of '{': inc depth
+      of '}': dec depth
+      else: discard
+    inc i
+  assert depth == 0,
+         label & " is " & $(-depth) & " brace(s) out of balance: " & response
+
 proc runTests() {.raises.} =
   var db = initDatabase(getCurrentDir())
 
@@ -301,6 +324,7 @@ proc runTests() {.raises.} =
            enumComplete.response
   # A name that is not a member of `Color` must not appear, or this is just the
   # scope chain again under a different label.
+  assertWellFormed(enumComplete.response, "member completion")
   assert not enumComplete.response.contains("\"label\":\"partial\""),
          "post-dot completion offered a name from outside the receiver's type: " &
          enumComplete.response
@@ -330,6 +354,7 @@ proc runTests() {.raises.} =
     assert partialComplete.response.contains(want),
            "post-dot completion on a partial name omitted " & want & ": " &
            partialComplete.response
+  assertWellFormed(partialComplete.response, "partial member completion")
   assert not partialComplete.response.contains("\"label\":\"partial\""),
          "a partial member name fell back to the scope chain: " &
          partialComplete.response
@@ -344,15 +369,27 @@ proc runTests() {.raises.} =
   discard partialDoc2
   let partialOpen = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim","languageId":"nim","version":1,"text":"type Color = enum\n  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  k.\n"}}}""")
   discard partialOpen
-  var worst = 0.0
-  for ch in [4, 5, 6]:
-    var started: MonoTime = getMonoTime()
-    discard handle(db, "{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"textDocument/completion\"," &
-      "\"params\":{\"textDocument\":{\"uri\":\"" & partialUri &
-      "\"},\"position\":{\"line\":4,\"character\":" & $ch & "}}}")
-    var ms = float64(inNanoseconds(getMonoTime() - started)) / 1_000_000.0
-    if ms > worst: worst = ms
-  echo "MEMBER COMPLETION: worst of three distinct cursor positions = ", worst, "ms"
+  # The same query against a module that imports something real. What decides the
+  # deferral is not the root module's size but whether sem has to re-resolve the
+  # import graph on every keystroke, so this is the number that matters -- the
+  # five-line one does not settle it.
+  let importedUri = "file:///workspace/lsp-dot-imported.nim"
+  let importedText = "import std/strutils\n\ntype Color = enum\n" &
+                     "  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  k.\n"
+  discard handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" &
+    importedUri & "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
+    importedText.replace("\n", "\\n") & "\"}}}")
+  for (label, uri, dotLine) in [("no import ", partialUri, 4),
+                                ("std/strutils", importedUri, 6)]:
+    var worst = 0.0
+    for ch in [4, 5, 6]:
+      var started: MonoTime = getMonoTime()
+      discard handle(db, "{\"jsonrpc\":\"2.0\",\"id\":103,\"method\":\"textDocument/completion\"," &
+        "\"params\":{\"textDocument\":{\"uri\":\"" & uri &
+        "\"},\"position\":{\"line\":" & $dotLine & ",\"character\":" & $ch & "}}}")
+      var ms = float64(inNanoseconds(getMonoTime() - started)) / 1_000_000.0
+      if ms > worst: worst = ms
+    echo "MEMBER COMPLETION ", label, ": worst of three positions = ", worst, "ms"
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot.nim"}}}""")
 
   # A document sem has already checked but which recorded no occurrences -- an

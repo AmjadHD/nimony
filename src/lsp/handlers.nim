@@ -192,9 +192,10 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
   if doc.memberCompletionAt(line, character):
     # A member: what can follow the `.` is the receiver's members, which sem
     # records from the receiver's established type. The scope chain and the import
-    # table are the wrong answer here -- they list every name in sight, not this
+    # type's -- so only the dot's own rows are offered. Reading `visible` here
+    # returns the whole scope chain, which is the answer 2v2 exists to replace.
     # type's -- so only the cursor query's rows are offered.
-    for symbol in query.visible:
+    for symbol in query.dotMembers:
       let name = symbol.name
       if name.len == 0 or name in labels: continue
       labels.incl name
@@ -204,7 +205,7 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
                                     "template", "macro", "converter"]: 3 else: 20
       result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
         ",\"detail\":" & quoteJson(symbol.kind) & "}"
-    result.add ']'
+    result.add "]}"
     return
   if query.documentMode:
     # Document mode records the module's import table once instead of the scope

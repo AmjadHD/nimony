@@ -1369,8 +1369,8 @@ proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
   for sym in enumerationMembers(root):
     var ide = c.ideSymbol(dest, sym)
     ide.kind = EfldY
-    c.ideQuery.visible.add ide
-  if c.ideQuery.visible.len > 0: c.ideQuery.matched = true
+    c.ideQuery.dotMembers.add ide
+  if c.ideQuery.dotMembers.len > 0: c.ideQuery.matched = true
 
 proc semDot(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemFlag]) =
   let exprStart = dest.len

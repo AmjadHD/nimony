@@ -161,6 +161,13 @@ type
     info*: NifLineInfo
     name*: StrId
     visible*, candidates*: seq[IdeSymbol]
+    ## A dot's members, kept apart from `visible` on purpose. Both are written
+    ## when the cursor sits on a half-typed member -- `captureIdeName` fires
+    ## because a name is under the cursor, `captureDotMembers` because the dot is
+    ## -- and `visible` is the whole scope chain. Sharing one field made a
+    ## completion after `result.` offer 1215 names instead of that type's members,
+    ## which is the pre-2v2 answer 2v2 exists to replace.
+    dotMembers*: seq[IdeSymbol]
     ## Document mode (track line 0) fills this with EVERY identifier in the
     ## module instead of stopping at the first match, so one compile answers
     ## every cursor position until the text changes.

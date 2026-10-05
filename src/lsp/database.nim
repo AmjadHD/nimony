@@ -38,6 +38,9 @@ type
   SemanticSnapshot* = object
     queried*, matched*, documentMode*: bool
     visible*, candidates*, imports*: seq[SemanticSymbol]
+    ## A dot's members, kept apart from `visible` because that is the whole scope
+    ## chain and sem writes both when the cursor is on a half-typed member.
+    dotMembers*: seq[SemanticSymbol]
     positions*: seq[IdePosition]
 
   Document* = ref object
@@ -727,6 +730,21 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
                                        symbols: symbols)
     elif fields.len >= 7 and fields[0] == "import":
       result.imports.add doc.symbolFromFields(fields)
+    elif fields.len >= 6 and fields[0] == "dotmember":
+      # A dot's members. Read from the row's own position rather than re-resolved
+      # through the syntax index, for the reason the `visible` branch above spells
+      # out: an enum field has no syntax node, so re-resolving drops every row.
+      var lineNo, column = 0
+      try:
+        lineNo = parseInt(fields[4])
+        column = parseInt(fields[5])
+      except:
+        continue
+      let source = if fields[3].len > 0: realFile(fields[3]) else: ""
+      result.dotMembers.add SemanticSymbol(name: fields[1], kind: fields[2],
+        uri: doc.uriForPath(source),
+        range: doc.sourceRange(source, lineNo, column, fields[1]),
+        doc: doc.docCommentAt(source, lineNo, column, fields[1]))
     elif fields.len >= 7 and fields[0] == "visible":
       var lineNo, column = 0
       try:
