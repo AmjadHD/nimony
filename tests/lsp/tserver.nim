@@ -1,4 +1,4 @@
-import std / [assertions, os, strutils, syncio, uri]
+import std / [assertions, monotimes, os, strutils, syncio, uri]
 import ../../src/lsp/[database, handlers]
 
 proc uriPathForTest(uriText: string): string {.raises.} =
@@ -304,6 +304,55 @@ proc runTests() {.raises.} =
   assert not enumComplete.response.contains("\"label\":\"partial\""),
          "post-dot completion offered a name from outside the receiver's type: " &
          enumComplete.response
+
+  # The steady state, not the empty-after-dot case: a *partially typed* member.
+  # This is what completion exists for, and it must be filtered by the receiver's
+  # type like the empty case -- not fall back to the scope chain.
+  let partialText = "type Color = enum\n  colRed, colGreen, colBlue\n\n" &
+                    "proc partial(k: Color) =\n  k.co\n"
+  let partialUri = "file:///workspace/lsp-dot-partial.nim"
+  discard handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" &
+    partialUri & "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
+    partialText.replace("\n", "\\n") & "\"}}}")
+  let partialComplete = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"textDocument/completion\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & partialUri &
+    "\"},\"position\":{\"line\":4,\"character\":7}}}")
+  let partialDoc = db.document(partialUri)
+  # Nothing is recorded at the cursor for `k.co` -- a half-typed name resolves to
+  # nothing -- which is exactly why the query cannot be routed by asking whether
+  # an occurrence is there. It is routed by the request being a completion.
+  var recordedAtCursor = 0
+  for position in partialDoc.snapshot.positions:
+    if position.line == 5: recordedAtCursor = position.symbols.len
+  assert recordedAtCursor == 0,
+         "a half-typed member was expected to record no symbol here"
+  for want in ["colRed", "colGreen", "colBlue"]:
+    assert partialComplete.response.contains(want),
+           "post-dot completion on a partial name omitted " & want & ": " &
+           partialComplete.response
+  assert not partialComplete.response.contains("\"label\":\"partial\""),
+         "a partial member name fell back to the scope chain: " &
+         partialComplete.response
+  discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim"}}}""")
+
+  # What a member completion costs. The cursor query spawns a `nimony check`, and
+  # the query cache is keyed on an exact line and column -- so the sequence a user
+  # actually types, `k.c` then `k.co` then `k.col`, is three distinct positions and
+  # three spawns. Measured, because "it wants caching" is not the same as knowing
+  # whether it is already too slow to use.
+  var partialDoc2 = db.document(partialUri)
+  discard partialDoc2
+  let partialOpen = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim","languageId":"nim","version":1,"text":"type Color = enum\n  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  k.\n"}}}""")
+  discard partialOpen
+  var worst = 0.0
+  for ch in [4, 5, 6]:
+    var started: MonoTime = getMonoTime()
+    discard handle(db, "{\"jsonrpc\":\"2.0\",\"id\":102,\"method\":\"textDocument/completion\"," &
+      "\"params\":{\"textDocument\":{\"uri\":\"" & partialUri &
+      "\"},\"position\":{\"line\":4,\"character\":" & $ch & "}}}")
+    var ms = float64(inNanoseconds(getMonoTime() - started)) / 1_000_000.0
+    if ms > worst: worst = ms
+  echo "MEMBER COMPLETION: worst of three distinct cursor positions = ", worst, "ms"
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot.nim"}}}""")
 
   # A document sem has already checked but which recorded no occurrences -- an

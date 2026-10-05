@@ -772,26 +772,31 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
         if fields[0] == "visible": result.visible.add symbol
         else: result.candidates.add symbol
 
-proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSnapshot {.raises.} =
+proc ideQueryAt*(db: Database; doc: Document; line, character: int;
+                 memberRequest = false): SemanticSnapshot {.raises.} =
   ## The answer for a cursor position. When the document was checked in document
   ## mode this is a lookup in the recorded positions and spawns nothing; the
   ## per-position compile is the fallback for a document sem has not run on.
   ##
-  ## A cursor sitting on a dot with *nothing typed after it* is the one position
-  ## that must skip the snapshot even when one exists. There is no identifier
-  ## occurrence recorded for it to find, and the answer -- the receiver's members
-  ## -- depends on the receiver's *type*, which only a cursor query computes. The
-  ## recorded import table cannot stand in for it.
+  ## A member *completion* is the one request that must skip the snapshot even
+  ## when one exists, and the discriminator is the request kind rather than the
+  ## shape of the position. The answer is the receiver's members, which depend on
+  ## the receiver's *type*; the snapshot answers "what is in scope here", which is
+  ## a different question, and the recorded import table is no substitute because
+  ## it lists every name in sight rather than this type's.
   ##
-  ## The test is "no name here", not "there is a dot here". A member name that
-  ## *has* been typed, `s.add`, is also preceded by a dot but is an ordinary
-  ## recorded occurrence, and answering it from a cursor query would throw away
-  ## the resolution -- which is the wrong symbol whenever the name is overloaded.
-  let position = if doc.snapshot.positions.len > 0
-                   : doc.snapshot.positionAt(line, character)
-                 else: IdePosition(line: -1, column: -1)
-  let emptyDot = doc.isMemberAccess(line, character) and position.symbols.len == 0
-  if doc.snapshot.positions.len > 0 and not emptyDot:
+  ## Deciding it by position instead does not work. Testing whether the character
+  ## before the cursor is a dot is true for `k.` and false for `k.co`, so it
+  ## selects the rare case and misses the partial name that completion exists for;
+  ## testing whether an occurrence is recorded there is no better, because a
+  ## half-typed name resolves to nothing and so looks absent. `memberRequest` is
+  ## passed in by the caller, which knows which of the three handlers it is.
+  ##
+  ## Hover and go-to-definition keep the snapshot even on a member name, because
+  ## there the resolution *is* the answer -- and for an overloaded name it is the
+  ## one that matters.
+  if doc.snapshot.positions.len > 0 and not memberRequest:
+    let position = doc.snapshot.positionAt(line, character)
     result = SemanticSnapshot(queried: true, matched: position.symbols.len > 0,
                               documentMode: true, visible: @[],
                               candidates: position.symbols,
@@ -807,7 +812,7 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSna
   # which is what an editor creates one of per session -- paid a full compile on
   # every keystroke, and a large file whose compile failed outright, leaving no
   # sidecar to record anything, paid one per hover across its whole import graph.
-  if doc.snapshot.queried and not emptyDot:
+  if doc.snapshot.queried and not memberRequest:
     return SemanticSnapshot(queried: true, matched: false,
                             visible: @[], candidates: @[])
   if doc.queryCached and doc.queryLine == line and doc.queryCharacter == character:
@@ -826,6 +831,19 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int): SemanticSna
 proc isMemberAccess*(doc: Document; line, character: int): bool =
   var offset = doc.positionOffset(line, character)
   while offset > 0 and doc.text[offset - 1] in {' ', '\t'}: dec offset
+  result = offset > 0 and doc.text[offset - 1] == '.'
+
+proc memberCompletionAt*(doc: Document; line, character: int): bool =
+  ## Is the cursor completing a member name -- i.e. does the identifier run it
+  ## sits in follow a `.`?
+  ##
+  ## Not the same question as `isMemberAccess`, which only sees a dot when the
+  ## cursor is *immediately* after it. That makes it true for `k.` and false for
+  ## `k.c`, `k.co`, `k.col` -- so it identifies the empty case, which is the rare
+  ## one, and misses the partial name, which is what completion is actually for.
+  ## Scanning back over the identifier run first makes all four the same question.
+  var offset = doc.positionOffset(line, character)
+  while offset > 0 and isIdentContinue(doc.text[offset - 1]): dec offset
   result = offset > 0 and doc.text[offset - 1] == '.'
 
 proc scopeAtLine(doc: Document; line: int): int =

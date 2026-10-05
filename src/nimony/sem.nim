@@ -1342,7 +1342,7 @@ proc enumerationMembers(typ: Cursor): seq[SymId] =
     inc n
 
 proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
-                       fieldNameCursor: Cursor; info: NifLineInfo) =
+                       info: NifLineInfo) =
   ## Record the members of a completed dot's receiver, for a completion request
   ## sitting on the dot with nothing typed after it.
   ##
@@ -1351,16 +1351,17 @@ proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
   ## receiver's type, so they cannot come from the import table either. This is
   ## what the per-position fallback is actually for.
   if not c.ideQuery.enabled or c.ideQuery.documentMode: return
-  # Only when no name follows the dot. The recovering parser leaves an `(err ...)`
-  # node there rather than a bare dot token, so "a symbol is present" is the test
-  # for "the user has typed something" -- the same condition `tryBuiltinDot` reads
-  # as `fieldName == StrId(0)`. With a name present the tree carries an ordinary
-  # identifier occurrence and the ordinary cursor query answers it.
-  if fieldNameCursor.isSymbol: return
   let query = c.ideQuery.info
   if not query.isValid: return
-  # The cursor must be on this dot, at or after it: an earlier `dot` on the same
-  # line must not capture the request.
+  # The cursor must be on this dot, at or after it. That is the whole test, and it
+  # deliberately does not ask whether a name follows: a *partially* typed member
+  # (`k.co`) is the case completion exists for, and it reaches here with a symbol
+  # after the dot that resolves to nothing. Keying on "no name follows" would
+  # serve the empty case and miss that one.
+  #
+  # The cost of the wider test is bounded: these rows land in `visible`, which only
+  # a member completion reads, so a hover that happens to run a cursor query pays
+  # the walk and ignores the answer.
   if query.line != int(info.line) or query.col < int(info.col): return
   var root = skipModifier(lhs.typ)
   if root.typeKind in {RefT, PtrT}: inc root
@@ -1386,7 +1387,7 @@ proc semDot(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemF
   let fieldNameCursor = it.n
   # Before anything is emitted for the dot: the receiver's type is
   # established here, and a completion request on the dot needs it.
-  captureDotMembers c, dest, lhs, fieldNameCursor, info
+  captureDotMembers c, dest, lhs, info
   let fieldName = takeIdent(it.n)
   # skip optional inheritance depth:
   if it.n.isIntLit:

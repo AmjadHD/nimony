@@ -189,11 +189,11 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
   result = "{\"isIncomplete\":false,\"items\":["
   var labels = initHashSet[string]()
   var first = true
-  if doc.isMemberAccess(line, character):
-    # A dot: what can follow it is the receiver's members, which sem records from
-    # the receiver's established type. The scope chain and the import table are
-    # the wrong answer here -- they list every name in sight, not this type's --
-    # so only the cursor query's rows are offered.
+  if doc.memberCompletionAt(line, character):
+    # A member: what can follow the `.` is the receiver's members, which sem
+    # records from the receiver's established type. The scope chain and the import
+    # table are the wrong answer here -- they list every name in sight, not this
+    # type's -- so only the cursor query's rows are offered.
     for symbol in query.visible:
       let name = symbol.name
       if name.len == 0 or name in labels: continue
@@ -312,7 +312,9 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
       # name is only reachable through the `dot`. Asking it first and tying the
       # query to a node id threw away every semantic answer for exactly those
       # positions, which is most call sites in practice.
-      let query = db.ideQueryAt(doc, pos.line, pos.character)
+      let memberRequest = methodName == "textDocument/completion" and
+                       doc.memberCompletionAt(pos.line, pos.character)
+      let query = db.ideQueryAt(doc, pos.line, pos.character, memberRequest)
       case methodName
       of "textDocument/completion": value = completionJson(doc, pos.line, pos.character, query)
       of "textDocument/hover": value = hoverJson(doc, nodeId, query)
