@@ -359,7 +359,32 @@ proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
   # the row. `candidate`, `visible` and `dotmember` are all name-keyed and a
   # signature is not a name, so it gets a row of its own rather than a shape they
   # would have to be told apart by.
+  # Only the call the cursor is inside. The bracket test upstream cannot distinguish
+  # a one-line call from a call whose arguments span fifty lines: a cursor anywhere
+  # between the first and last argument satisfies it, so a query inside such a call
+  # collected that call's overloads *and* every other multi-line call enclosing the
+  # same region. Observed on handlers.nim: five signatures, two of them duplicated,
+  # none of them belonging to the call under the cursor.
+  #
+  # The innermost enclosing call is the one whose own position is the last at or
+  # before the cursor. `callNodeInfo` is the callee's, so this picks the closest
+  # preceding call rather than the nearest argument.
+  var best = c.ideQuery.info
+  var bestValid = false
   for sig in c.ideQuery.signatures:
+    if not sig.callAt.isValid: continue
+    if sig.callAt.line > best.line or
+       (sig.callAt.line == best.line and sig.callAt.col > best.col): continue
+    if not bestValid or sig.callAt.line > best.line or
+       (sig.callAt.line == best.line and sig.callAt.col >= best.col):
+      best = sig.callAt
+      bestValid = true
+  # Nothing at or before the cursor means the cursor is not inside a call, and the
+  # answer is no signature at all -- not the whole file's worth of them.
+  if not bestValid:
+    for sig in c.ideQuery.signatures: discard sig
+  for sig in c.ideQuery.signatures:
+    if not bestValid or sig.callAt != best: continue
     output.add "signature\t" & pool.symBasename(sig.sym) & "\t" & $sig.kind &
       "\t" & escapeTsv(sig.params) & "\n"
   # A dot's members, under their own tag. `visible` is the whole scope chain, and

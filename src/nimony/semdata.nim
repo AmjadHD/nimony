@@ -163,7 +163,9 @@ type
     ## one, and the names need the `CallArg` widening this deliberately does not do.
     ## See `doc/lsp-overload-query.md`.
     sym*: SymId
-    kind*: SymKind  ## the candidate's own kind, not a re-lookup: the overload set
+    kind*: SymKind
+    callAt*: NifLineInfo  ## where the call itself is, so the client-visible list can
+                        ## be narrowed to the one call the cursor is inside  ## the candidate's own kind, not a re-lookup: the overload set
                     ## knows whether this is a proc or an iterator
     params*: string
 

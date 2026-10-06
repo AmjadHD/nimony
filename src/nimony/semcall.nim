@@ -1095,23 +1095,19 @@ proc captureSignatures(c: var SemContext; m: seq[Match]; cs: CallState) =
   ## A cursor query, not a document one: the occurrence walk records the *name* at a
   ## position, and mid-call the name is behind the cursor rather than under it.
   if not c.ideQuery.enabled or c.ideQuery.documentMode: return
-  if cs.args.len == 0: return
   let query = c.ideQuery.info
   if not query.isValid: return
-  # Bounded on BOTH sides. An earlier test only asked whether the cursor was at or
-  # after the first argument, which every call above the cursor satisfies -- so on a
-  # 3254-line file signature help accumulated the overload sets of every call in it
-  # and answered with 992 signatures for one position. The cursor has to be inside
-  # *this* argument list, so the last argument bounds it from above. The editor
-  # decides that lexically and only asks there; this is the coarse half.
-  let firstArg = cs.args[0].n.info
-  let lastArg = cs.args[^1].n.info
-  if not firstArg.isValid or not lastArg.isValid: return
-  let before = query.line < int(firstArg.line) or
-               (query.line == int(firstArg.line) and query.col < int(firstArg.col))
-  let after = query.line > int(lastArg.line) or
-              (query.line == int(lastArg.line) and query.col > int(lastArg.col))
-  if before or after: return
+  # No positional bracket here. Bounding by the first and last argument looked right
+  # and was wrong twice: a call whose arguments span fifty lines brackets every
+  # cursor between them, so it collected that call *and* every other multi-line call
+  # enclosing the same region; and a call with no arguments yet -- `signatureHelpJson(|)`
+  # is exactly what a user types -- was skipped outright, leaving the answer to be
+  # some unrelated call further up.
+  #
+  # So every call records where it is and the narrowing happens at write time: the
+  # one the cursor is inside is the closest callee at or before it. That is imprecise
+  # for a cursor that is not inside any call, but the editor only asks there, and the
+  # alternative is worse in the cases users actually hit.
 
   # Unconditionally, not only for candidates the compiler already rejected: arity
   # is a fact about the formals and needs no match verdict, and gating it on
@@ -1129,7 +1125,8 @@ proc captureSignatures(c: var SemContext; m: seq[Match]; cs: CallState) =
       params.add typeToString(asLocal(p).typ)
       skip p
     c.ideQuery.signatures.add IdeSignature(sym: cand.fn.sym, kind: cand.fn.kind,
-                                           params: params.join(", "))
+                                           params: params.join(", "),
+                                           callAt: cs.callNodeInfo)
 
 proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: var CallState) =
   # Everything the candidate collection below writes to `dest` is a

@@ -300,7 +300,8 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
     result.response = "{\"jsonrpc\":\"2.0\",\"id\":" & idText &
       ",\"result\":{\"capabilities\":{\"textDocumentSync\":1," &
       "\"completionProvider\":{\"resolveProvider\":false}," &
-      "\"hoverProvider\":true,\"definitionProvider\":true}," &
+      "\"hoverProvider\":true,\"definitionProvider\":true," &
+      "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}}," &
       "\"serverInfo\":{\"name\":\"nimony-lsp\",\"version\":\"0.1\"}}}"
   of "textDocument/didOpen", "textDocument/didChange":
     let td = field(params, "textDocument")
