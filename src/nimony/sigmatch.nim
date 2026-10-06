@@ -2881,10 +2881,12 @@ proc argTypeIsUnknown(arg: CallArg): bool =
 proc arityEliminates(fn: FnCandidate; argCount: int): bool =
   ## Is the argument count itself proof? It needs no types at all, so it holds
   ## however unfinished every argument is.
-  if fn.kind notin RoutineKinds: return false
+  if fn.kind notin RoutineKinds:
+    quit "[arity] not a routine kind=" & $fn.kind
   var f = fn.typ
   if f.typeKind in RoutineTypes: skipToParams f
-  if f.substructureKind != ParamsU: return false
+  if f.substructureKind != ParamsU:
+    quit "[arity] no params, substructureKind=" & $f.substructureKind
   var required = 0
   var total = 0
   var hasVarargs = false
@@ -2893,7 +2895,7 @@ proc arityEliminates(fn: FnCandidate; argCount: int): bool =
     let param = asLocal(scan)
     inc total
     if param.typ.tagEnum == VarargsTagId: hasVarargs = true
-    elif not param.val.isDotToken: inc required # no default: the arg must exist
+    elif param.val.isDotToken: inc required # no default: the argument must exist
     skip scan
   if argCount < required: return true
   not hasVarargs and argCount > total

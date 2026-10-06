@@ -1087,6 +1087,43 @@ proc runCompiledMacroPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
   else:
     buildErr c, dest, cs.callNodeInfo, "macro '" & pool.symString(finalFn) & "' not compiled"
 
+proc captureSignatures(c: var SemContext; m: seq[Match]; cs: CallState) =
+  ## Record the overloads the cursor's call could still resolve to, and each one's
+  ## parameter types. Signature help and mid-call completion ask the same question
+  ## -- "which candidates survive" -- so they read one list.
+  ##
+  ## A cursor query, not a document one: the occurrence walk records the *name* at a
+  ## position, and mid-call the name is behind the cursor rather than under it.
+  if not c.ideQuery.enabled or c.ideQuery.documentMode: return
+  if cs.args.len == 0: return
+  let query = c.ideQuery.info
+  if not query.isValid: return
+  # At or after the first argument: the cursor is inside the parentheses, the only
+  # place a signature is wanted. The editor decides that lexically and only asks
+  # there; this is the coarse half of the same test.
+  let firstArg = cs.args[0].n.info
+  if not firstArg.isValid: return
+  if query.line < int(firstArg.line) or
+     (query.line == int(firstArg.line) and query.col < int(firstArg.col)): return
+
+  # Unconditionally, not only for candidates the compiler already rejected: arity
+  # is a fact about the formals and needs no match verdict, and gating it on
+  # `cand.err` let a two-parameter overload survive a one-argument call.
+  for cand in m:
+    if candidateEliminated(addr c, cand.fn, cs.args): continue
+    # `skipToParams` then `sub`, exactly as `sigmatchLoop` does it: the first
+    # lands *on* `(params ...)`, and reading `asLocal` without stepping inside
+    # yields nil types, which stringify to nothing.
+    var params = newSeqOfCap[string](4)
+    var f = cand.fn.typ
+    if f.typeKind in RoutineTypes: skipToParams f
+    var p = if f.substructureKind == ParamsU: sub(f) else: f
+    while p.hasMore:
+      params.add typeToString(asLocal(p).typ)
+      skip p
+    c.ideQuery.signatures.add IdeSignature(sym: cand.fn.sym, kind: cand.fn.kind,
+                                           params: params.join(", "))
+
 proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: var CallState) =
   # Everything the candidate collection below writes to `dest` is a
   # DIAGNOSTIC ("attempt to call routine", a symchoice element that cannot be
@@ -1178,6 +1215,11 @@ proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: v
   # global pools without allocating storage, so on the overwhelmingly common
   # path where nothing errored it costs nothing; `createTokenBuf` below
   # allocates only once there is a diagnostic to keep.
+  # After the candidate set is complete and before a winner is picked: "which
+  # candidates survive" is only meaningful with the whole set in hand, and the
+  # winner is one of them rather than the list.
+  captureSignatures c, m, cs
+
   var earlyErr = initTokenBuf()
   if dest.len > errStart:
     earlyErr = createTokenBuf(4)

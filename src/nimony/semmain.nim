@@ -355,6 +355,13 @@ proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
       "\t" & file & "\t" & $symbol.info.line &
       "\t" & $symbol.info.col & "\t" &
       $(pool.symModule(symbol.id) == c.thisModuleSuffix) & "\n"
+  # The overloads of the call the cursor is inside, with their parameter types on
+  # the row. `candidate`, `visible` and `dotmember` are all name-keyed and a
+  # signature is not a name, so it gets a row of its own rather than a shape they
+  # would have to be told apart by.
+  for sig in c.ideQuery.signatures:
+    output.add "signature\t" & pool.symBasename(sig.sym) & "\t" & $sig.kind &
+      "\t" & escapeTsv(sig.params) & "\n"
   # A dot's members, under their own tag. `visible` is the whole scope chain, and
   # both are written when the cursor is on a half-typed member, so a client cannot
   # separate them if they share a row type.

@@ -156,6 +156,17 @@ type
     info*: NifLineInfo
     candidates*: seq[IdeSymbol]
 
+type
+  IdeSignature* = object
+    ## One overload of the call the cursor is inside, and its parameter *types*.
+    ## No names: `proc(int, string)` without `x, msg` is a worse popup than a wrong
+    ## one, and the names need the `CallArg` widening this deliberately does not do.
+    ## See `doc/lsp-overload-query.md`.
+    sym*: SymId
+    kind*: SymKind  ## the candidate's own kind, not a re-lookup: the overload set
+                    ## knows whether this is a proc or an iterator
+    params*: string
+
   IdeQuery* = object
     enabled*, matched*, documentMode*: bool
     info*: NifLineInfo
@@ -179,6 +190,11 @@ type
     ## Decided up front rather than when a dot is reached, because the identifier
     ## *before* the dot is semmed first and would ask before the answer is known.
     dotRequest*: bool
+    ## The overloads of the call the cursor is inside, with parameter types.
+    ## Empty unless a cursor query landed mid-call. Separate from `candidates`,
+    ## which is the *resolution*: one chosen symbol, for a name under the cursor.
+    ## Here the name is behind the cursor and nothing has been chosen yet.
+    signatures*: seq[IdeSignature]
     ## Document mode (track line 0) fills this with EVERY identifier in the
     ## module instead of stopping at the first match, so one compile answers
     ## every cursor position until the text changes.
