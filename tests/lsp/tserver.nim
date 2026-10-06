@@ -1,4 +1,4 @@
-import std / [assertions, monotimes, os, strutils, syncio, uri]
+import std / [assertions, os, strutils, syncio, uri]
 import ../../src/lsp/[database, handlers]
 
 proc uriPathForTest(uriText: string): string {.raises.} =
@@ -373,23 +373,23 @@ proc runTests() {.raises.} =
   # deferral is not the root module's size but whether sem has to re-resolve the
   # import graph on every keystroke, so this is the number that matters -- the
   # five-line one does not settle it.
+  #
+  # These two documents are opened and queried so the shape stays exercised, but
+  # nothing is printed: `tests/lsp` is a joined group, and it is expected to be
+  # silent. The measurement that once lived here also cannot be a golden -- a
+  # latency assertion is not reproducible -- so it belongs in a commit message,
+  # not in a test's output. Its finding is recorded in 46b95299.
   let importedUri = "file:///workspace/lsp-dot-imported.nim"
   let importedText = "import std/strutils\n\ntype Color = enum\n" &
                      "  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  k.\n"
   discard handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" &
     importedUri & "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
     importedText.replace("\n", "\\n") & "\"}}}")
-  for (label, uri, dotLine) in [("no import ", partialUri, 4),
-                                ("std/strutils", importedUri, 6)]:
-    var worst = 0.0
+  for (uri, dotLine) in [(partialUri, 4), (importedUri, 6)]:
     for ch in [4, 5, 6]:
-      var started: MonoTime = getMonoTime()
       discard handle(db, "{\"jsonrpc\":\"2.0\",\"id\":103,\"method\":\"textDocument/completion\"," &
         "\"params\":{\"textDocument\":{\"uri\":\"" & uri &
         "\"},\"position\":{\"line\":" & $dotLine & ",\"character\":" & $ch & "}}}")
-      var ms = float64(inNanoseconds(getMonoTime() - started)) / 1_000_000.0
-      if ms > worst: worst = ms
-    echo "MEMBER COMPLETION ", label, ": worst of three positions = ", worst, "ms"
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot.nim"}}}""")
 
   # A document sem has already checked but which recorded no occurrences -- an

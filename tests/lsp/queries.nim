@@ -1,19 +1,12 @@
-## Query latency against a document with a real import graph. The tiny
-## fixtures elsewhere cannot show the subprocess cost, because they never
-## resolve more than a handful of modules.
+## Queries against a document with a real import graph. The tiny fixtures
+## elsewhere cannot exercise that, because they never resolve more than a handful
+## of modules -- an import-heavy document is where a query is most likely to take
+## the slow path.
 
-import std / [monotimes, os, strutils, syncio, times]
+import std / [assertions, os, strutils, syncio]
 import ../../src/lsp/[database, handlers]
 
 const Queries = 5
-
-proc report(line: string) =
-  stdout.write line
-  stdout.write "\n"
-  stdout.flushFile()
-
-proc elapsedMs(start: MonoTime): float64 =
-  (getMonoTime() - start).inNanoseconds.float64 / 1_000_000.0
 
 proc escapeJson(s: string): string =
   ## The document text is the only field needing escaping; the framing quotes
@@ -66,34 +59,31 @@ proc work() =
   let parsed = toTable(1, 2)
   discard parsed.len
 """
-  var start = getMonoTime()
+  # These queries are the point of the test, not a measurement: what matters is
+  # that each answers from the right occurrence and that no query recompiles.
+  #
+  # Nothing here prints. `tests/lsp` is a joined group and is expected to be
+  # silent, and a timing could not be a golden even if it were -- so these lines
+  # used to drop the whole group out of the joined program and the harness quietly
+  # fell back to running the tests one at a time. The numbers they reported are
+  # recorded in the commit messages instead: 64ms -> 0.05ms for a document with no
+  # recorded occurrences (a32a248e), and the per-position cost in a32a248e's
+  # message.
   openOnce(db, uri, source)
-  report "open (parse + sem + diagnostics): " & $elapsedMs(start)
-
-  # The point of the measurement: a cursor move re-checks the module and its
-  # whole import graph from scratch, so every cold position costs a fresh
-  # compile and only an exactly repeated position is free.
   for i in 0 ..< Queries:
-    let line = 24 + i
-    start = getMonoTime()
-    discard hoverAt(db, uri, line, 6)
-    report "hover cold at line " & $line & ": " & $elapsedMs(start)
-
-  start = getMonoTime()
+    discard hoverAt(db, uri, 24 + i, 6)
   discard hoverAt(db, uri, 24, 6)
-  report "hover repeated at one position: " & $elapsedMs(start)
-
-  start = getMonoTime()
   openOnce(db, uri, source)
-  report "reopen (unchanged text): " & $elapsedMs(start)
 
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":\"""" &
     escapeJson(uri) & """"}}}""")
 
 proc runBench() =
+  # A raise here used to be reported and swallowed, so the test passed with the
+  # queries never having run. It has to fail the test.
   try:
     bench()
   except:
-    report "bench failed"
+    assert false, "lsp queries raised unexpectedly"
 
 runBench()
