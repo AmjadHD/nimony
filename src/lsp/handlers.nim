@@ -253,6 +253,30 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
         ",\"detail\":" & quoteJson(n.declarationKind) & "}"
   result.add "]}"
 
+proc signatureHelpJson(query: SemanticSnapshot): string =
+  ## LSP's `SignatureHelp`: one entry per surviving overload, each a label plus its
+  ## parameters. Types only -- a parameter without its name is a worse popup than a
+  ## wrong one, and the names need the `CallArg` widening (see the 2v2 note).
+  ##
+  ## `signatures: []` is a real answer, not a failure: the cursor is not in a call,
+  ## or every overload is provably out.
+  result = "{\"signatures\":["
+  var first = true
+  for sig in query.signatures:
+    if not first: result.add ','
+    first = false
+    let label = sig.name & "(" & sig.params & ")"
+    result.add "{\"label\":" & quoteJson(label) & ",\"parameters\":["
+    var firstParam = true
+    for param in sig.params.split(","):
+      let text = param.strip
+      if text.len == 0: continue
+      if not firstParam: result.add ','
+      firstParam = false
+      result.add "{\"label\":" & quoteJson(text) & "}"
+    result.add "]}"
+  result.add "],\"activeSignature\":0,\"activeParameter\":0}"
+
 proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
   result = HandlerResult(response: "", notification: "", stop: false)
   var parsed = parseJson(body)
@@ -300,7 +324,8 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
     result.notification = "{\"jsonrpc\":\"2.0\",\"method\":" &
       "\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" &
       quoteJson(uriText) & ",\"diagnostics\":[]}}"
-  of "textDocument/completion", "textDocument/hover", "textDocument/definition":
+  of "textDocument/completion", "textDocument/hover", "textDocument/definition",
+     "textDocument/signatureHelp":
     let uriText = field(params, "textDocument").strField("uri")
     let doc = db.document(uriText)
     var value = "null"
@@ -315,10 +340,16 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
       # positions, which is most call sites in practice.
       let memberRequest = methodName == "textDocument/completion" and
                        doc.memberCompletionAt(pos.line, pos.character)
-      let query = db.ideQueryAt(doc, pos.line, pos.character, memberRequest)
+      # Signature help is the other request that must not be answered from the
+      # recorded occurrences: sem only records which overloads survive for a cursor
+      # query, and mid-call there is no identifier at the cursor to look up.
+      let signatureRequest = methodName == "textDocument/signatureHelp"
+      let query = db.ideQueryAt(doc, pos.line, pos.character, memberRequest,
+                                signatureRequest)
       case methodName
       of "textDocument/completion": value = completionJson(doc, pos.line, pos.character, query)
       of "textDocument/hover": value = hoverJson(doc, nodeId, query)
+      of "textDocument/signatureHelp": value = signatureHelpJson(query)
       else: value = definitionJson(doc, nodeId, query)
     result.response = "{\"jsonrpc\":\"2.0\",\"id\":" & idText &
       ",\"result\":" & value & "}"

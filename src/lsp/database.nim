@@ -41,7 +41,15 @@ type
     ## A dot's members, kept apart from `visible` because that is the whole scope
     ## chain and sem writes both when the cursor is on a half-typed member.
     dotMembers*: seq[SemanticSymbol]
+    ## The overloads the cursor's call could still resolve to. Empty unless a
+    ## cursor query landed mid-call, and a first-class "no result" otherwise.
+    signatures*: seq[SemanticSignature]
     positions*: seq[IdePosition]
+
+  SemanticSignature* = object
+    ## One surviving overload of the call the cursor is inside, with its parameter
+    ## *types*. No names: they need the `CallArg` widening, deliberately not done.
+    name*, kind*, params*: string
 
   Document* = ref object
     uri*, path*: string
@@ -730,6 +738,12 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
                                        symbols: symbols)
     elif fields.len >= 7 and fields[0] == "import":
       result.imports.add doc.symbolFromFields(fields)
+    elif fields.len >= 4 and fields[0] == "signature":
+      # Keyed by name and params, not by position: there is no identifier at the
+      # cursor mid-call -- the callee's name is behind it. So this cannot use the
+      # row's own line/col the way `visible` and `dotmember` do.
+      result.signatures.add SemanticSignature(name: fields[1], kind: fields[2],
+                                             params: unescapeTsv(fields[3]))
     elif fields.len >= 6 and fields[0] == "dotmember":
       # A dot's members. Read from the row's own position rather than re-resolved
       # through the syntax index, for the reason the `visible` branch above spells
@@ -791,14 +805,20 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
         else: result.candidates.add symbol
 
 proc ideQueryAt*(db: Database; doc: Document; line, character: int;
-                 memberRequest = false): SemanticSnapshot {.raises.} =
+                 memberRequest = false;
+                 needCursorQuery = false): SemanticSnapshot {.raises.} =
   ## The answer for a cursor position. When the document was checked in document
   ## mode this is a lookup in the recorded positions and spawns nothing; the
   ## per-position compile is the fallback for a document sem has not run on.
   ##
-  ## A member *completion* is the one request that must skip the snapshot even
-  ## when one exists, and the discriminator is the request kind rather than the
-  ## shape of the position. The answer is the receiver's members, which depend on
+  ## Two requests must skip the snapshot even when one exists, and the discriminator
+  ## in both is the request kind rather than the shape of the position.
+  ##
+  ## `needCursorQuery` is signature help: it asks which overloads the call could
+  ## still resolve to, and sem only ever records that for a cursor query. Sharing
+  ## `memberRequest` with it would be wrong twice over -- it would also suppress
+  ## the scope-chain walk, which a signature does not need -- so it is a separate
+  ## flag rather than an overload of one. The answer is the receiver's members, which depend on
   ## the receiver's *type*; the snapshot answers "what is in scope here", which is
   ## a different question, and the recorded import table is no substitute because
   ## it lists every name in sight rather than this type's.
@@ -813,7 +833,7 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int;
   ## Hover and go-to-definition keep the snapshot even on a member name, because
   ## there the resolution *is* the answer -- and for an overloaded name it is the
   ## one that matters.
-  if doc.snapshot.positions.len > 0 and not memberRequest:
+  if doc.snapshot.positions.len > 0 and not memberRequest and not needCursorQuery:
     let position = doc.snapshot.positionAt(line, character)
     result = SemanticSnapshot(queried: true, matched: position.symbols.len > 0,
                               documentMode: true, visible: @[],
@@ -830,7 +850,7 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int;
   # which is what an editor creates one of per session -- paid a full compile on
   # every keystroke, and a large file whose compile failed outright, leaving no
   # sidecar to record anything, paid one per hover across its whole import graph.
-  if doc.snapshot.queried and not memberRequest:
+  if doc.snapshot.queried and not memberRequest and not needCursorQuery:
     return SemanticSnapshot(queried: true, matched: false,
                             visible: @[], candidates: @[])
   if doc.queryCached and doc.queryLine == line and doc.queryCharacter == character:
