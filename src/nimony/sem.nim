@@ -1317,19 +1317,28 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
   if result == MatchedDotField:
     commonType c, dest, it, exprStart, expected
 
-proc enumerationMembers(typ: Cursor): seq[SymId] =
-  ## An enum type's fields, in declaration order.
+proc qualifiedEnumMembers(typ: Cursor): seq[SymId] =
+  ## The fields of an enum type, in declaration order -- for a receiver that *is*
+  ## the type.
   ##
-  ## Deliberately narrow. `findObjFieldConsiderVis` looks a field up by name for
-  ## a `dot` that already has one, and there is no counterpart that lists an
-  ## object's members, so this covers the case that needs no such traversal: an
-  ## enum's fields hang directly off the type's body as `EfldY` symbols. Anything
-  ## else yields nothing, which is 2v1's existing answer for a receiver it cannot
-  ## describe -- an empty completion list is the documented degradation, not a
-  ## wrong one.
+  ## An enum *value* has no fields. Its literals are reached bare (`k == colRed`)
+  ## or qualified through the type (`Color.colRed`), which is what `tryBuiltinDot`
+  ## resolves in its `TypedescT` branch. Offering them after `k.` produced a
+  ## completion that does not compile: `k.colRed` is an error, not a field access.
+  ## So the receiver has to be a `TypeddescT`, not a value of enum type.
+  ##
+  ## Deliberately narrow on the other side too. `findObjFieldConsiderVis` looks a
+  ## field up by name for a `dot` that already has one, and there is no
+  ## counterpart that lists an object's members -- so a receiver whose type is an
+  ## object still yields nothing, which is 2v1's existing answer for a receiver it
+  ## cannot describe. An empty completion list is the documented degradation; a
+  ## list of names that do not compile is not.
   result = @[]
-  if not typ.isSymbol: return
-  let section = getTypeSection(typ.symId)
+  if typ.typeKind != TypedescT: return
+  var inner = typ # the type inside `typedesc[...]`, as `tryBuiltinDot` does
+  inc inner
+  if not inner.isSymbol: return
+  let section = getTypeSection(inner.symId)
   if section.kind != TypeY: return
   let body = section.body
   if body.typeKind notin {EnumT, HoleyEnumT, AnumT}: return
@@ -1363,10 +1372,8 @@ proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
   # a member completion reads, so a hover that happens to run a cursor query pays
   # the walk and ignores the answer.
   if query.line != int(info.line) or query.col < int(info.col): return
-  var root = skipModifier(lhs.typ)
-  if root.typeKind in {RefT, PtrT}: inc root
-  discard skipInvoke(root)
-  for sym in enumerationMembers(root):
+  let root = skipModifier(lhs.typ)
+  for sym in qualifiedEnumMembers(root):
     var ide = c.ideSymbol(dest, sym)
     ide.kind = EfldY
     c.ideQuery.dotMembers.add ide

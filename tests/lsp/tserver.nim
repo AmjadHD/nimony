@@ -304,8 +304,12 @@ proc runTests() {.raises.} =
   # document-mode occurrence walk has no symbol to record for the position, and
   # the import table lists every name in sight rather than this type's members --
   # so the snapshot cannot answer it even when it exists.
+  # The receiver must be the enum *type*, not a value of it. `Color.colRed` is
+  # real Nim -- `tryBuiltinDot` resolves it in its `TypeddescT` branch -- while
+  # `k.colRed` is an error, so completing after `k.` would suggest code that does
+  # not compile.
   let dotText = "type Color = enum\n  colRed, colGreen, colBlue\n\n" &
-                "proc partial(k: Color) =\n  k.\n"
+                "proc partial(k: Color) =\n  Color.\n"
   let dotUri = "file:///workspace/lsp-dot.nim"
   let dotOpened = handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\"," &
     "\"params\":{\"textDocument\":{\"uri\":\"" & dotUri &
@@ -313,11 +317,11 @@ proc runTests() {.raises.} =
     dotText.replace("\n", "\\n") & "\"}}}")
   assert not dotOpened.notification.contains("semantic analysis failed"),
          "the dot fixture failed to compile: " & dotOpened.notification
-  # `k.` on 0-based line 4, cursor right after the dot, at end of file -- the shape
-  # a user is actually in while typing.
+  # `Color.` on 0-based line 4, cursor right after the dot, at end of file -- the
+  # shape a user is actually in while typing.
   let enumComplete = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"textDocument/completion\"," &
     "\"params\":{\"textDocument\":{\"uri\":\"" & dotUri &
-    "\"},\"position\":{\"line\":4,\"character\":4}}}")
+    "\"},\"position\":{\"line\":4,\"character\":8}}}")
   for want in ["colRed", "colGreen", "colBlue"]:
     assert enumComplete.response.contains(want),
            "post-dot completion on an enum omitted " & want & ": " &
@@ -329,25 +333,44 @@ proc runTests() {.raises.} =
          "post-dot completion offered a name from outside the receiver's type: " &
          enumComplete.response
 
+  # And the negative case, which is the one that was wrong: a receiver that is an
+  # enum *value* has no fields at all, so there is nothing to offer. Completing
+  # `k.` to the literals is what this used to do, and `k.colRed` does not compile.
+  let valueText = "type Color = enum\n  colRed, colGreen, colBlue\n\n" &
+                  "proc valueCase(k: Color) =\n  k.\n"
+  let valueUri = "file:///workspace/lsp-dot-value.nim"
+  discard handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" &
+    valueUri & "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
+    valueText.replace("\n", "\\n") & "\"}}}")
+  let valueComplete = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"textDocument/completion\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & valueUri &
+    "\"},\"position\":{\"line\":4,\"character\":4}}}")
+  assertWellFormed(valueComplete.response, "member completion on an enum value")
+  for unwanted in ["colRed", "colGreen", "colBlue"]:
+    assert not valueComplete.response.contains(unwanted),
+           "an enum value was given fields it does not have: " & unwanted & " in " &
+           valueComplete.response
+
   # The steady state, not the empty-after-dot case: a *partially typed* member.
   # This is what completion exists for, and it must be filtered by the receiver's
   # type like the empty case -- not fall back to the scope chain.
   let partialText = "type Color = enum\n  colRed, colGreen, colBlue\n\n" &
-                    "proc partial(k: Color) =\n  k.co\n"
+                    "proc partial(k: Color) =\n  discard k\n  Color.co\n"
   let partialUri = "file:///workspace/lsp-dot-partial.nim"
   discard handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" &
     partialUri & "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
     partialText.replace("\n", "\\n") & "\"}}}")
   let partialComplete = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"textDocument/completion\"," &
     "\"params\":{\"textDocument\":{\"uri\":\"" & partialUri &
-    "\"},\"position\":{\"line\":4,\"character\":7}}}")
+    "\"},\"position\":{\"line\":5,\"character\":9}}}")
   let partialDoc = db.document(partialUri)
-  # Nothing is recorded at the cursor for `k.co` -- a half-typed name resolves to
-  # nothing -- which is exactly why the query cannot be routed by asking whether
-  # an occurrence is there. It is routed by the request being a completion.
+  # Nothing is recorded at the cursor for `Color.co` -- a half-typed name resolves
+  # to nothing -- which is exactly why the query cannot be routed by asking
+  # whether an occurrence is there. It is routed by the request being a
+  # completion.
   var recordedAtCursor = 0
   for position in partialDoc.snapshot.positions:
-    if position.line == 5: recordedAtCursor = position.symbols.len
+    if position.line == 6: recordedAtCursor = position.symbols.len
   assert recordedAtCursor == 0,
          "a half-typed member was expected to record no symbol here"
   for want in ["colRed", "colGreen", "colBlue"]:
@@ -367,7 +390,7 @@ proc runTests() {.raises.} =
   # whether it is already too slow to use.
   var partialDoc2 = db.document(partialUri)
   discard partialDoc2
-  let partialOpen = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim","languageId":"nim","version":1,"text":"type Color = enum\n  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  k.\n"}}}""")
+  let partialOpen = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim","languageId":"nim","version":1,"text":"type Color = enum\n  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  discard k\n  Color.co\n"}}}""")
   discard partialOpen
   # The same query against a module that imports something real. What decides the
   # deferral is not the root module's size but whether sem has to re-resolve the
@@ -381,12 +404,12 @@ proc runTests() {.raises.} =
   # not in a test's output. Its finding is recorded in 46b95299.
   let importedUri = "file:///workspace/lsp-dot-imported.nim"
   let importedText = "import std/strutils\n\ntype Color = enum\n" &
-                     "  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  k.\n"
+                     "  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  discard k\n  Color.\n"
   discard handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" &
     importedUri & "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
     importedText.replace("\n", "\\n") & "\"}}}")
-  for (uri, dotLine) in [(partialUri, 4), (importedUri, 6)]:
-    for ch in [4, 5, 6]:
+  for (uri, dotLine, dotCol) in [(partialUri, 5, 9), (importedUri, 6, 7)]:
+    for ch in [dotCol, dotCol + 1, dotCol + 2]:
       discard handle(db, "{\"jsonrpc\":\"2.0\",\"id\":103,\"method\":\"textDocument/completion\"," &
         "\"params\":{\"textDocument\":{\"uri\":\"" & uri &
         "\"},\"position\":{\"line\":" & $dotLine & ",\"character\":" & $ch & "}}}")

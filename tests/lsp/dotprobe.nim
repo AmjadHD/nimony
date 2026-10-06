@@ -58,14 +58,21 @@ proc rowsFor(tag: string): seq[string] {.raises.} =
 proc runTests() {.raises.} =
   writeFile(module, "type Color = enum\n  colRed, colGreen\n\n" &
                     "proc use(s: string) =\n  discard s.len\n\n" &
-                    "proc partial(k: Color) =\n  k.colRed\n")
+                    "proc partial(k: Color) =\n  discard k\n  Color.colRed\n  k.colRed\n")
 
-  # Both cursors sit inside a member name that follows a dot, so both are member
-  # requests by the lexical rule. Nothing but the position distinguishes them,
-  # which is why the editor cannot be the thing that tells them apart.
-  let positions = [("cursor on `colRed` in `k.colRed`", 8, 5, true),
-                   ("cursor on the `len` in `s.len`", 5, 13, false)]
-  for (label, line, col, isEnumDot) in positions:
+  # Three cursors, all inside a member name that follows a dot, so all three are
+  # member requests by the lexical rule. Nothing but the position distinguishes
+  # them, which is why the editor cannot be the thing that tells them apart.
+  #
+  # The two enum rows are the point. `Color.colRed` is real Nim -- a qualified
+  # access, resolved in `tryBuiltinDot`'s `TypeddescT` branch -- so that dot has
+  # two members. `k.colRed` is an error: an enum *value* has no fields, so it has
+  # none. Offering the literals for both is what produced a completion that did
+  # not compile.
+  let positions = [("qualified `Color.colRed`", 9, 9, 2),
+                   ("value `k.colRed`", 10, 5, 0),
+                   ("`s.len`", 5, 13, 0)]
+  for (label, line, col, wantDotMembers) in positions:
     discard execCmdEx("rm -rf " & cache)
     # 1-based, as the LSP spells it and as `cursorCompletesMember` reads it.
     discard execCmdEx("bin/nimony --nimcache:" & cache & " check " & module &
@@ -76,17 +83,18 @@ proc runTests() {.raises.} =
     let visibleRows = rowsFor("visible")
     echo label, ": dotmember=", dotRows.len,
          " candidate=", candidateRows.len, " visible=", visibleRows.len
+    # The ~4s: a walk over every visible name that no member query can use.
     assert visibleRows.len == 0,
            label & " walked the scope chain anyway: " & $visibleRows.len &
            " rows, and that walk is the ~4s"
-    if isEnumDot:
-      assert dotRows.len == 2,
-             "the dot's two enum fields were not recorded: " & $dotRows.len
-    else:
-      # The coarse skip would have taken this with it: a member request by
-      # position, which still needs the name under the cursor resolved.
+    assert dotRows.len == wantDotMembers,
+           label & " recorded " & $dotRows.len & " members, expected " &
+           $wantDotMembers
+    # The coarse skip would have taken `s.len` with it: it is a member request by
+    # position, which still needs the name under the cursor resolved.
+    if wantDotMembers == 0:
       assert candidateRows.len > 0,
-             "hover lost the name under the cursor: no candidate was resolved"
+             label & " lost the name under the cursor: no candidate was resolved"
 
   discard execCmdEx("rm -rf " & cache & " " & module)
   echo "dotprobe: ok"
