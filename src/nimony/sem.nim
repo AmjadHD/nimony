@@ -1553,7 +1553,20 @@ proc captureIdeName(c: var SemContext; dest: var TokenBuf; ident: StrId;
     return
   if c.ideQuery.matched or not cursorMatchesName(info, ident, c.ideQuery): return
   c.ideQuery.candidates = c.visibleDeclarationsAtCursor(ident, info, dest)
-  c.ideQuery.visible = c.visibleSymbolsAtCursor(dest, c.ideQuery.info)
+  # A member completion is answered from the dot's own rows, so walking every
+  # visible name produces nothing this query can use -- and that walk is where the
+  # time goes. It was the whole cost on handlers.nim: ~4144ms per member query
+  # against ~163ms for the same query with this line skipped, a 25x difference
+  # spent building a list the query then discarded.
+  #
+  # Only `visible` is skipped, and that is deliberate. `candidates` above resolves
+  # just the one name under the cursor and is cheap, and hover and definition both
+  # read it -- a member name's cursor satisfies `dotRequest` too, so skipping the
+  # whole branch would silently blank hover on `s.add` for any document whose
+  # document-mode compile recorded no occurrences. Nothing outside the scope-chain
+  # branch of completion reads `visible`, so leaving it empty costs no one.
+  if not c.ideQuery.dotRequest:
+    c.ideQuery.visible = c.visibleSymbolsAtCursor(dest, c.ideQuery.info)
   c.ideQuery.matched = true
 
 proc captureIdeImports*(c: var SemContext; dest: var TokenBuf) =

@@ -416,6 +416,27 @@ proc sameSourceFile(a, b: string): bool =
   except:
     false
 
+proc cursorCompletesMember(source: string; line, col: int): bool =
+  ## Does the cursor sit in a member name -- that is, does the identifier run it
+  ## is inside follow a `.`?
+  ##
+  ## The same lexical test the editor applies before it asks for a member
+  ## completion, so the two cannot disagree about what was requested. Decided
+  ## here, once, rather than when a dot is reached, because the identifier before
+  ## the dot is semmed first and would ask before the answer is known.
+  var offset = 0
+  var current = 1
+  while current < line and offset < source.len:
+    if source[offset] == '\n': inc current
+    inc offset
+  offset += max(0, col - 1) # the protocol and this config both spell col 1-based
+  var i = min(offset, source.len)
+  # `nimlexer`'s `SymChars`: a name is letters, digits, underscore, or any
+  # non-ASCII byte -- the last so a unicode identifier is not cut in half.
+  while i > 0 and (source[i - 1] in {'a'..'z', 'A'..'Z', '0'..'9', '_'} or
+                   source[i - 1] >= '\x80'): dec i
+  result = i > 0 and source[i - 1] == '.'
+
 proc enableIdeQuery(c: var SemContext; source: string) =
   let track = c.g.config.toTrack
   # Line 0 asks for the whole document: every identifier occurrence, the import
@@ -426,7 +447,8 @@ proc enableIdeQuery(c: var SemContext; source: string) =
     c.ideQuery = IdeQuery(enabled: true, documentMode: track.line == 0,
       info: NifLineInfo(file: pool.filenames.getOrIncl(track.filename),
                         line: track.line, col: track.col),
-      name: StrId(0), visible: @[], candidates: @[])
+      name: StrId(0), visible: @[], candidates: @[],
+      dotRequest: cursorCompletesMember(source, track.line, track.col))
 
 proc requestHookInstance(c: var SemContext; decl: Cursor) =
   let decl = asTypeDecl(decl)

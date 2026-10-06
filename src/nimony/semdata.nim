@@ -168,6 +168,17 @@ type
     ## completion after `result.` offer 1215 names instead of that type's members,
     ## which is the pre-2v2 answer 2v2 exists to replace.
     dotMembers*: seq[IdeSymbol]
+    ## Set once, from the cursor position, when the cursor sits in a member name.
+    ##
+    ## This is a property of the *position*, not of the request. A cursor resting
+    ## on `add` in `s.add` sets it exactly as a half-typed `k.co` does, and a
+    ## hover there is still a hover. So this may only be used to skip work whose
+    ## result is never read by any request kind -- never to skip resolving the
+    ## name under the cursor, which hover and definition both need.
+    ##
+    ## Decided up front rather than when a dot is reached, because the identifier
+    ## *before* the dot is semmed first and would ask before the answer is known.
+    dotRequest*: bool
     ## Document mode (track line 0) fills this with EVERY identifier in the
     ## module instead of stopping at the first match, so one compile answers
     ## every cursor position until the text changes.
