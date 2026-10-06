@@ -383,6 +383,29 @@ proc runTests() {.raises.} =
          partialComplete.response
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim"}}}""")
 
+  # An object receiver, end to end. `members.nim` checks the rows the sidecar
+  # carries; this checks what the client actually receives, which is a different
+  # thing -- a label, a kind and a detail string per member.
+  let objText = "type Obj = object\n  pub*: int\n  priv: int\n\n" &
+                "proc partial(o: Obj) =\n  o.pu\n"
+  let objUri = "file:///workspace/lsp-dot-object.nim"
+  discard handle(db, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" &
+    objUri & "\",\"languageId\":\"nim\",\"version\":1,\"text\":\"" &
+    objText.replace("\n", "\\n") & "\"}}}")
+  let objComplete = handle(db, "{\"jsonrpc\":\"2.0\",\"id\":104,\"method\":\"textDocument/completion\"," &
+    "\"params\":{\"textDocument\":{\"uri\":\"" & objUri &
+    "\"},\"position\":{\"line\":5,\"character\":5}}}")
+  assertWellFormed(objComplete.response, "object member completion")
+  # `priv` is reachable in the module that declares it, so it belongs here; the
+  # cross-module case is in members.nim.
+  for want in ["pub", "priv"]:
+    assert objComplete.response.contains("\"label\":\"" & want & "\""),
+           "object member completion omitted " & want & ": " & objComplete.response
+  assert not objComplete.response.contains("\"label\":\"partial\""),
+         "object member completion offered a name from outside the receiver: " &
+         objComplete.response
+  discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-object.nim"}}}""")
+
   # What a member completion costs. The cursor query spawns a `nimony check`, and
   # the query cache is keyed on an exact line and column -- so the sequence a user
   # actually types, `k.c` then `k.co` then `k.col`, is three distinct positions and

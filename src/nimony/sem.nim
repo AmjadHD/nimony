@@ -1317,6 +1317,62 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
   if result == MatchedDotField:
     commonType c, dest, it, exprStart, expected
 
+proc fieldVisibleIn(owner: SymId; visMod: string): bool =
+  ## `findObjFieldConsiderVis`'s rule, for a field found by name: an exported
+  ## field is visible everywhere, a private one only inside the module that
+  ## declares the type. `pool.symModule(owner) == ""` means a type with no owning
+  ## module, which the lookup treats as visible.
+  if owner == SymId(0): return true
+  let ownerModule = pool.symModule(owner)
+  ownerModule == "" or ownerModule == visMod
+
+proc collectObjMembers(c: var SemContext; decl: TypeDecl; owner: SymId;
+                       visMod: string; acc: var seq[SymId];
+                       seen: var HashSet[StrId]) =
+  ## `decl`'s own fields, then its base's, in the order a lookup would try them.
+  ##
+  ## The walk mirrors `findObjFieldAux`: the object's fields come before the base
+  ## type's, so a field redeclared in a derived type shadows the base's -- hence
+  ## `seen`, keyed by name rather than by symbol.
+  ##
+  ## No bindings are threaded through. `findObjFieldAux` needs them to instantiate
+  ## the *type* of the field it found; this wants only the names, which a generic
+  ## object's fields carry either way. That is also why the `TokenBuf` that
+  ## `bindSubsInvokeArgs` requires to outlive its cursors does not appear here.
+  var n = objBody(decl)
+  n = sub(n) # skip `(object`, bounding the walk
+  var baseType = n
+  skip n, SkipType # skip the base type
+  var iter = initObjFieldIter()
+  while nextField(iter, n):
+    let field = takeLocal(n, SkipFinalParRi)
+    if field.name.isSymbolDef:
+      let nameId = field.name.symId
+      # Keyed by the name's id, not by the field's own symbol: a field
+      # redeclared in a derived type is a different symbol from the one it
+      # shadows, so it would not shadow anything.
+      if not seen.containsOrIncl(pool.symNameId(nameId)):
+        if not field.exported.isDotToken or fieldVisibleIn(owner, visMod):
+          acc.add nameId
+
+  if baseType.isDotToken: return
+  if baseType.typeKind in {RefT, PtrT}: inc baseType
+  discard skipInvoke(baseType)
+  if not baseType.isSymbol: return
+  let baseDecl = getTypeSection(baseType.symId)
+  if baseDecl.kind != TypeY: return
+  collectObjMembers(c, baseDecl, genericRootSym(baseDecl), visMod, acc, seen)
+
+proc objectMembers(c: var SemContext; decl: TypeDecl; info: NifLineInfo): seq[SymId] =
+  ## Every field reachable through `decl`'s dot, own fields first.
+  result = @[]
+  var seen: HashSet[StrId]
+  # Judge visibility against the module the code was WRITTEN in, as the lookup
+  # does -- a template body reaches sem in the consumer's module but a private
+  # field belongs to the one that wrote it.
+  let visMod = visibilityModule(c, info)
+  collectObjMembers(c, decl, genericRootSym(decl), visMod, result, seen)
+
 proc qualifiedEnumMembers(typ: Cursor): seq[SymId] =
   ## The fields of an enum type, in declaration order -- for a receiver that *is*
   ## the type.
@@ -1372,8 +1428,23 @@ proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
   # a member completion reads, so a hover that happens to run a cursor query pays
   # the walk and ignores the answer.
   if query.line != int(info.line) or query.col < int(info.col): return
-  let root = skipModifier(lhs.typ)
-  for sym in qualifiedEnumMembers(root):
+  var root = skipModifier(lhs.typ)
+  if root.typeKind in {RefT, PtrT}: inc root
+  discard skipInvoke(root)
+  var members: seq[SymId] = @[]
+  if root.isSymbol:
+    let decl = getTypeSection(root.symId)
+    if decl.kind == TypeY:
+      # The body must be known to be an object before it is walked. `semDot` makes
+      # the same check before it looks a field up, and skipping it reads an enum's
+      # body as a field list -- which is not a wrong answer but a hard failure:
+      # "illformed AST inside object" out of `takeLocal`, and no sidecar at all.
+      var objType = decl.body
+      if objType.typeKind in {RefT, PtrT}: inc objType
+      if objType.typeKind == ObjectT:
+        members = objectMembers(c, decl, info)
+  members.add qualifiedEnumMembers(root)
+  for sym in members:
     var ide = c.ideSymbol(dest, sym)
     ide.kind = EfldY
     c.ideQuery.dotMembers.add ide
