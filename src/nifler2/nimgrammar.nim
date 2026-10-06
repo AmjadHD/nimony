@@ -255,7 +255,14 @@ grammar:
   primarySuffix(mode: PrimaryMode) """&noSpaceBefore
                         ^call[ '(' flexComment? optPar (exprColonEqExprList({tkParRi}) | listEnd({tkParRi})) optPar ')' ]""":
     callOrObjConstr p, m
-  primarySuffix(mode: PrimaryMode) """^dot[ '.' optInd symbolOrKeyword
+  # `&dotOpensFieldAccess` leads the alternative, which is the only place the
+  # generator emits a semantic predicate as a guard: a parenthesised group with no
+  # `|` is flattened into the enclosing sequence, so a predicate written between
+  # `optInd` and `symbolOrKeyword` -- which is where the decision belongs -- is
+  # silently dropped. It is reachable in the generated source and never called.
+  # Hence the guard reads the buffer past the dot instead. See
+  # `dotOpensFieldAccess` for what it decides.
+  primarySuffix(mode: PrimaryMode) """&dotOpensFieldAccess ^dot[ '.' optInd symbolOrKeyword
                              (&noSpaceBefore at[ '[:' exprList ']' ] posMarker
                               (&noSpaceBefore '(' flexComment? optPar (exprColonEqExprList({tkParRi}) | listEnd({tkParRi})) optPar ')')?)? ]""":
     dotLayout p, m

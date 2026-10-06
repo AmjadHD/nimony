@@ -81,8 +81,33 @@ proc runFixtures() {.raises.} =
   let fixtures = os.getCurrentDir() / "tests" / "lsp" / "parser_recovery"
   checkRecovery(readFile(fixtures / "unclosed_paren.nim.txt"), "afterParen")
   checkRecovery(readFile(fixtures / "dangling_dot.nim.txt"), "afterDot")
+  checkRecovery(readFile(fixtures / "dangling_dot_before_proc.nim.txt"), "other")
   checkRecovery(readFile(fixtures / "incomplete_let.nim.txt"), "afterLet", "= 1")
   checkRecovery(readFile(fixtures / "truncated_expression.nim.txt"), "value")
+
+proc checkLegalDots() =
+  ## A dot's field name may be a keyword -- `a.and`, `a.type`, `a.import` are all
+  ## real accesses -- so the guard that stops a dangling dot from eating the next
+  ## declaration has to be narrow. It reads "a declaration keyword with a name
+  ## behind it", and the two halves fail separately:
+  ##
+  ## * `a.type` alone, or followed by another statement on the next line, must stay
+  ##   a field access. Reaching the name may not cross a newline: skipping one made
+  ##   `let y = a.type` + `let z = 1` read as a `type` declaration named `let`, and
+  ##   rejected a legal `a.type`.
+  ## * `a.import` with nothing behind it must stay a field access too -- there is no
+  ##   name, so there is no declaration.
+  for src in ["let x = a.and\n", "let y = a.type\n", "let z = a.addr\n",
+              "let w = a.import\n", "let v = a.type\nlet u = 1\n"]:
+    var p = openParser(src, "parser_recovery.nim", pool, globalTags)
+    p.recovering = true
+    parseModule p
+    let tree = toString(finish(p))
+    p.close()
+    assert p.errors.len == 0,
+           "a legal keyword field access was rejected: " & src & " -> " & tree
+    assert tree.contains("(dot"),
+           "the field access did not survive: " & src & " -> " & tree
 
 proc checkCheckers() =
   ## The two checks above are only worth having if they reject what they should,
@@ -108,6 +133,7 @@ proc checkCheckers() =
 
 try:
   runFixtures()
+  checkLegalDots()
   checkCheckers()
 except:
   assert false, "failed to read parser recovery fixture"

@@ -1,0 +1,4 @@
+proc partial(k: int) =
+  k.
+proc other() =
+  discard 1

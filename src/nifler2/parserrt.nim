@@ -162,6 +162,54 @@ const
   errInvalidIndentation* = "invalid indentation"
   NestableStmts = {tkIf, tkWhile, tkCase, tkTry, tkFor, tkBlock, tkAsm, tkProc,
                    tkFunc, tkIterator, tkMacro, tkType, tkConst, tkWhen, tkVar}
+  DeclarationStarter = {tkProc, tkFunc, tkMethod, tkIterator, tkTemplate,
+                        tkMacro, tkConverter, tkImport, tkInclude, tkExport,
+                        tkType, tkConst, tkVar, tkLet, tkEnum, tkObject,
+                        tkTuple, tkIf, tkWhile, tkFor, tkCase, tkTry, tkOf,
+                        tkElse, tkElif, tkBlock, tkYield, tkReturn, tkRaise,
+                        tkBreak, tkContinue, tkDefer, tkMixin, tkAsm}
+  ## Keywords that open a declaration or a statement. A dot's field name may be
+  ## any keyword, so this set is only ever consulted together with the "is a name
+  ## behind it" test -- see `dotOpensFieldAccess`. Operand-taking keywords
+  ## (`and`, `or`,
+  ## `in`, `is`, ...) are not here: `x.and` is a real field access and nothing
+  ## writes `x.and y`.
+
+proc isNameChar*(c: char): bool {.inline.} =
+  ## `nimlexer`'s `SymChars`: a name is letters, digits, underscore, or any
+  ## non-ASCII byte -- the last so a unicode identifier is not cut in half.
+  c in {'a'..'z', 'A'..'Z', '0'..'9', '_'} or c >= '\x80'
+
+proc startsDeclarationName*(buf: string; pos: int): bool {.inline.} =
+  ## Does a declaration keyword with a name behind it start at `pos`?
+  ##
+  ## Only `dotOpensFieldAccess` needs this, and only because the guard the
+  ## generator emits sees the dot rather than the token after it. A set is the
+  ## wrong shape for it: `DeclarationStarter` is a compile-time constant, and a
+  ## `HashSet` built from one is not a compile-time value here. Thirty-odd
+  ## comparisons per dot is not a cost worth a second data structure to avoid --
+  ## this runs once per dot token, not once per field.
+  ##
+  ## The two skips below cross different amounts of whitespace, and that is the
+  ## whole trick. Reaching the keyword may cross lines: that is the dangling dot's
+  ## own shape, `k.` on one line and `proc other` on the next. Reaching the *name*
+  ## may not -- `a.type` followed by `let z = ...` is two field accesses and a
+  ## declaration, and a newline-crossing skip reads the `let` as the name of a
+  ## `type` declaration and rejects a legal `a.type`. A declaration always spells
+  ## its keyword and its name on one line.
+  var i = pos
+  while i < buf.len and buf[i] in {' ', '\t', '\n', '\r'}: inc i
+  let stop = i
+  while i < buf.len and isNameChar(buf[i]): inc i
+  let word = buf[stop ..< i]
+  var isDeclaration = false
+  for k in DeclarationStarter:
+    if $k == word:
+      isDeclaration = true
+      break
+  if not isDeclaration: return false
+  while i < buf.len and buf[i] in {' ', '\t'}: inc i
+  i < buf.len and isNameChar(buf[i])
 
 proc prettyTok*(t: Token): string =
   ## `prettyTok` in `compiler/lexer.nim`.
@@ -442,6 +490,40 @@ proc dotLikeOps*(p: Parser): bool {.inline.} =
   ## is an ordinary infix operator -- `a.?b.c` is `(infix .? a (dot b c))` --
   ## and the answer is `false`.
   false
+
+proc dotOpensFieldAccess*(p: Parser): bool {.inline.} =
+  ## Called with `p.tok` on a `.` that is about to open a field access. Returns
+  ## false when what follows is a declaration keyword *with a name behind it*,
+  ## because then the dot has no field name and the keyword starts a declaration.
+  ##
+  ## A field name may be any keyword -- `a.and`, `a.or`, `a.shl`, `a.addr`,
+  ## `a.type` are all real accesses, and `symbolOrKeyword` exists to allow them --
+  ## but `proc other` after a dangling dot is not a field name:
+  ##
+  ##     proc partial(k: Color) =
+  ##       k.
+  ##     proc other(): string =
+  ##       "x"
+  ##
+  ## `symbolOrKeyword` cannot tell those apart, and guessing "keyword" is what let
+  ## the dot eat the declaration: `proc` became the field name, `other` became a
+  ## call argument, and the `proc` was gone from the tree. That is an ordinary
+  ## editing moment -- what the buffer looks like between typing the dot and the
+  ## field name.
+  ##
+  ## This reads the buffer rather than the token stream because of where the
+  ## generator lets a predicate sit: only a predicate that *leads* an alternative
+  ## is emitted as a guard, and the token here is the dot, not the field name. The
+  ## buffer is sentinel-terminated, so reading past the end is safe.
+  ##
+  ## `x.proc`, `x.proc(1)` and a field genuinely named `import` stay field names:
+  ## none of them has a name after the keyword. An operator procedure
+  ## (`proc +(a, b: int)`) is the one shape read as a field name, since `+` is not
+  ## a name.
+  ##
+  ## Note the guard is emitted as `if not this then skip`, so this answers "may
+  ## the dot open a field access?" and NOT "does a declaration follow?".
+  not startsDeclarationName(p.lex.buf, p.lex.pos)
 
 proc inTypeDesc*(p: Parser; mode: PrimaryMode): bool {.inline.} =
   ## `parser.nim`'s `if mode == pmTypeDesc` in `commandParam`.
