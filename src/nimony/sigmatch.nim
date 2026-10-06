@@ -2868,6 +2868,87 @@ proc inferTypevarsFromExpected(m: var Match) =
       if not m.inferred.hasKey(v):
         bindTypevar m, v, inf
 
+proc argTypeIsUnknown(arg: CallArg): bool =
+  ## An argument whose type is not decided yet cannot eliminate anything.
+  ##
+  ## `AutoT` is `anArgIsStillUntyped`'s case -- `auto` means "not decided", not
+  ## "a type that happens to be Auto". The two shapes that carry no type at all
+  ## count as unknown for the same reason: nothing about them can be proved
+  ## against a formal.
+  if cursorIsNil(arg.typ): return true
+  arg.typ.typeKind == AutoT
+
+proc arityEliminates(fn: FnCandidate; argCount: int): bool =
+  ## Is the argument count itself proof? It needs no types at all, so it holds
+  ## however unfinished every argument is.
+  if fn.kind notin RoutineKinds: return false
+  var f = fn.typ
+  if f.typeKind in RoutineTypes: skipToParams f
+  if f.substructureKind != ParamsU: return false
+  var required = 0
+  var total = 0
+  var hasVarargs = false
+  var scan = sub(f)
+  while scan.hasMore:
+    let param = asLocal(scan)
+    inc total
+    if param.typ.tagEnum == VarargsTagId: hasVarargs = true
+    elif not param.val.isDotToken: inc required # no default: the arg must exist
+    skip scan
+  if argCount < required: return true
+  not hasVarargs and argCount > total
+
+proc candidateEliminated*(context: ptr SemContext; fn: FnCandidate;
+                          args: openArray[CallArg]): bool =
+  ## Rule (b): a candidate is eliminated only on arity, or on a *resolved*
+  ## argument provably incompatible with its formal. An argument whose type is not
+  ## decided eliminates nothing, whatever else is true of the call.
+  ##
+  ## A generic candidate is never eliminated on type grounds here. Whether a
+  ## formal mentioning an unbound typevar is incompatible depends on what some
+  ## *other* argument would bind it to, and with a half-typed call there may be no
+  ## such argument yet -- so the honest verdict is `unknown`, not `incompatible`.
+  ## That is the ownerless-typevar rule applied as a whole: the slow way to
+  ## eliminate a generic overload is the same cost (b) already accepts for an
+  ## unknown argument, surfacing again here. Lifting it needs per-pair provenance
+  ## (`m.pos` and `ftyp` in `sigmatchLoop`) to tell an incompatibility in the
+  ## formal's head from one inside an unbound typevar's argument; that is not
+  ## attempted until a caller needs the difference.
+  if arityEliminates(fn, args.len): return true
+  if fn.kind notin RoutineKinds: return false
+
+  var m = createMatch(context)
+  matchTypevars(m, fn, default(Cursor))
+  if m.tvars.len > 0: return false # generic: no type-grounded verdict
+  for arg in args:
+    if argTypeIsUnknown(arg): return false # one unknown arg silences the rest
+
+  var f = fn.typ
+  if f.typeKind in RoutineTypes: skipToParams f
+  if f.substructureKind != ParamsU: return false
+  var i = 0
+  var g = sub(f)
+  while g.hasMore and i < args.len:
+    let param = asLocal(g)
+    var ftyp = param.typ
+    if ftyp.tagEnum != VarargsTagId:
+      if args[i].n.isDotToken: # a default: this arg went to a later formal
+        skip g
+        continue
+      skip g
+    else:
+      # A varargs formal's element type is behind an invoke this file does not
+      # unwrap, and a wrong unwrap is worse than no verdict: skip the pair.
+      skip g
+      inc i
+      continue
+    if not cursorIsNil(ftyp):
+      var probe = createMatch(context)
+      typematch(probe, ftyp, Item(n: emptyNode(context[]), typ: args[i].typ))
+      if classifyMatch(probe) == NoMatch: return true
+    inc i
+  false
+
 proc anArgIsStillUntyped(args: openArray[CallArg]): bool =
   ## `auto` on an argument is not a type, it is "not decided yet": an empty
   ## literal (`@[]`) whose element type only the enclosing context can supply.
