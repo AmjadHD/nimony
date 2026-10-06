@@ -1098,13 +1098,20 @@ proc captureSignatures(c: var SemContext; m: seq[Match]; cs: CallState) =
   if cs.args.len == 0: return
   let query = c.ideQuery.info
   if not query.isValid: return
-  # At or after the first argument: the cursor is inside the parentheses, the only
-  # place a signature is wanted. The editor decides that lexically and only asks
-  # there; this is the coarse half of the same test.
+  # Bounded on BOTH sides. An earlier test only asked whether the cursor was at or
+  # after the first argument, which every call above the cursor satisfies -- so on a
+  # 3254-line file signature help accumulated the overload sets of every call in it
+  # and answered with 992 signatures for one position. The cursor has to be inside
+  # *this* argument list, so the last argument bounds it from above. The editor
+  # decides that lexically and only asks there; this is the coarse half.
   let firstArg = cs.args[0].n.info
-  if not firstArg.isValid: return
-  if query.line < int(firstArg.line) or
-     (query.line == int(firstArg.line) and query.col < int(firstArg.col)): return
+  let lastArg = cs.args[^1].n.info
+  if not firstArg.isValid or not lastArg.isValid: return
+  let before = query.line < int(firstArg.line) or
+               (query.line == int(firstArg.line) and query.col < int(firstArg.col))
+  let after = query.line > int(lastArg.line) or
+              (query.line == int(lastArg.line) and query.col > int(lastArg.col))
+  if before or after: return
 
   # Unconditionally, not only for candidates the compiler already rejected: arity
   # is a fact about the formals and needs no match verdict, and gating it on
