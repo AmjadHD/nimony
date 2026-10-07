@@ -1120,10 +1120,32 @@ proc dependencyClosureReady(db: Database; doc: Document): bool =
   ## missing interface with `quit`, which ends the process outright and which
   ## nothing in the editor can catch: the first cold query killed the server
   ## rather than falling back.
+  ## So the test is coarse on purpose: has THIS document already been checked
+  ## successfully? That run built every interface sem will now ask for, which is a
+  ## stronger statement than any re-derivation from the source could be.
+  ##
+  ## This gate was wrong twice, and both versions looked like a working flag right
+  ## up until something was measured. It first asked for this document's own
+  ## `<module>.s.nif`, which in IDE mode is NEVER written -- `semcheckCore` returns
+  ## before `writeOutput`, because the sidecar is the output -- so the gate was
+  ## permanently false and the flag never engaged a single query. It then asked for
+  ## every `import` row's suffix, which failed 18 consecutive keystrokes on
+  ## `basic_types.nim`: a row names a submodule as well as a module, and that one
+  ## has no `.s.nif` of its own because it is folded into `system`. Neither was
+  ## visible to the handler suite, which asks each document once. Only a typing
+  ## benchmark, which is the shape an editor is actually in, showed either.
+  ##
+  ## Residual risk, stated rather than hidden: an edit that ADDS an import whose
+  ## interface has never been built passes this gate and then asks sem for it, and
+  ## `vfs.openMmapImpl` answers a missing interface with `quit` -- which ends the
+  ## server, and which nothing here can catch. Closing that needs `deps.nim`
+  ## in-process. Until then the subprocess is the default and this is opt-in.
   result = false
-  if not os.fileExists(db.cacheDir / (doc.moduleName & ".s.nif")): return false
-  # `std/system` is imported implicitly rather than listed, and it is the one
-  # import sem always needs.
+  # `runCompiler` removes the sidecar before each run and writes it only on
+  # success, so its presence means the last check of this document worked.
+  if not os.fileExists(db.cacheDir / (doc.moduleName & ".ide.tsv")): return false
+  # `std/system` is imported implicitly, never appears as an `import` row, and is
+  # the one interface sem always needs.
   if not os.fileExists(db.cacheDir / (SystemModuleSuffix & ".s.nif")): return false
   result = true
 
