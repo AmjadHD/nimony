@@ -181,6 +181,11 @@ type
     ## This is also the boundary the editor should program against rather than sem's
     ## internal query state, which is what lets the two change independently.
     queried*, matched*, documentMode*: bool
+    ## The suffix of the module that was checked. A reader needs it to tell a
+    ## symbol declared in this file from one merely visible in it -- the same
+    ## `pool.symModule(id) == thisModuleSuffix` test `writeIdeQuery` applies per
+    ## row, which cannot be recovered from a `SymId` alone once the run is over.
+    moduleSuffix*: string
     visible*, candidates*, imports*, dotMembers*: seq[IdeSymbol]
     signatures*: seq[IdeSignature]
     positions*: seq[IdeResolution]

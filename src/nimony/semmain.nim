@@ -1040,6 +1040,7 @@ proc semcheckInProcess*(infiles, outfiles: seq[string]; config: sink NifConfig;
 
   result = IdeQueryResult(queried: c.ideQuery.enabled, matched: c.ideQuery.matched,
                           documentMode: c.ideQuery.documentMode,
+                          moduleSuffix: c.thisModuleSuffix,
                           visible: c.ideQuery.visible, candidates: c.ideQuery.candidates,
                           imports: c.ideQuery.imports,
                           dotMembers: c.ideQuery.dotMembers,

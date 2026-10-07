@@ -3,11 +3,13 @@
 
 {.feature: "lenientnils".}
 
-import std / [tables, strutils, os, hashes, dirs, paths, syncio, osproc]
+import std / [tables, strutils, os, hashes, dirs, paths, syncio, osproc, envvars]
 import ../nifler2 / [nimgrammar, nimlexer, parserrt]
 import ../nifler2 / niflerout
 import ../lib / comesfrom
 import ../gear2 / modnames
+import ../lib / nifpools
+import ../nimony / [semmain, semdata, nifconfig, semos, builtintypes]
 
 type
   SourceRange* = object
@@ -271,6 +273,27 @@ proc runDiagnostics*(db: var Database; doc: var Document) {.raises.} =
   ## on every cursor move.
   doc.queryLine = -1
   doc.queryCharacter = -1
+  if semInProcess() and db.dependencyClosureReady(doc):
+    try:
+      let res = db.runSemInProcess(doc, -1, -1)
+      doc.snapshot = snapshotFromQuery(doc, res, -1, -1)
+      correctPositionColumns(doc)
+      # Errors still come from the sidecar, which in-process sem still writes.
+      # That is the honest state of this: the query travels as a struct, the
+      # diagnostics do not yet, and pretending otherwise would mean reading a
+      # file this path no longer needs for the query -- reintroducing the
+      # dependency it was meant to remove.
+      doc.semanticDiagnostics = semanticErrors(sidecarFor(db, doc))
+      return
+    except:
+      # Falling back rather than reporting: the subprocess path is slower but
+      # proven, and a query is worth more than an explanation of why it could
+      # not be answered. The reason goes to stderr, which is the only channel
+      # here -- stdout is the JSON-RPC transport.
+      # The exception's message is not reachable from a bare `except` in this
+      # stdlib, so the fallback reason is logged without it. stderr, because
+      # stdout is the JSON-RPC transport.
+      stderr.writeLine "[nimony-lsp] in-process sem failed, falling back to the subprocess"
   let content = db.runCompiler(doc)
   doc.snapshot = parseIdeSnapshot(doc, content.sidecar, -1, -1)
   correctPositionColumns(doc)
@@ -386,6 +409,20 @@ proc firstErrorLine(output: string): string =
     if line.strip.len > 0:
       return line.strip
   ""
+
+proc sidecarFor(db: Database; doc: Document): string =
+  ## The sidecar `writeIdeQuery` wrote for this document, or the empty string.
+  ## Named because three callers now want it, and inlining the path three times
+  ## is how a rename leaves one behind.
+  result = ""
+  let f = db.cacheDir / (doc.moduleName & ".ide.tsv")
+  if os.fileExists(f):
+    # A missing or unreadable sidecar is the empty string, not a raise: the
+    # caller treats empty as "no query recorded", which is the right answer for a
+    # document sem has not run on. Reporting it as an error would turn a normal
+    # editor state into a broken one.
+    try: result = readFile(f)
+    except: discard
 
 proc runCompiler*(db: Database; doc: Document): tuple[sidecar: string,
                                                        failure: string] {.raises.} =
@@ -810,6 +847,215 @@ proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
         if fields[0] == "visible": result.visible.add symbol
         else: result.candidates.add symbol
 
+proc symbolAtInfo(doc: Document; name, kind: string; lineNo, column: int;
+                  source: string): SemanticSymbol {.raises.} =
+  ## A symbol placed from the position its own record carries.
+  ##
+  ## This is what `symbolFromFields` does for a `candidate`, `import` or
+  ## `dotmember` row: take the declaration's file, line and column from the row
+  ## rather than looking anything up. That is the whole reason document-mode
+  ## resolution survives at all -- a `position` row's candidates are the
+  ## resolution sem already computed, and re-deriving them from the syntax index
+  ## can land on a different occurrence of the same name. For a shadowed name that
+  ## is the difference between the inner declaration and the outer one, which is
+  ## not a subtle difference: it is the wrong answer.
+  if source.len == 0:
+    return SemanticSymbol(name: name, kind: kind, uri: "", range: SourceRange())
+  SemanticSymbol(name: name, kind: kind, uri: doc.uriForPath(source),
+                 range: doc.sourceRange(source, lineNo, column, name),
+                 doc: doc.docCommentAt(source, lineNo, column, name))
+
+proc symbolForSym(doc: Document; sym: IdeSymbol; moduleSuffix: string;
+                  queryLine, queryCharacter: int;
+                  resolveAtCursor: bool): SemanticSymbol {.raises.} =
+  ## One symbol as the editor sees it, from a resolved `SymId`.
+  ##
+  ## Every value here comes from where `symbolFromFields` takes it -- `symBasename`,
+  ## `$kind`, the declaration's file/line/column -- so the two readers cannot
+  ## drift on what a symbol *is*.
+  ##
+  ## `isLocal` is `pool.symModule(id) == moduleSuffix`, the same comparison
+  ## `writeIdeQuery` makes per row. It is not recoverable from the `SymId` once the
+  ## run is over, which is why `IdeQueryResult` carries `moduleSuffix`.
+  ##
+  ## `resolveAtCursor` mirrors the reader's `visible` branch and nothing else. A
+  ## `visible` row says where a symbol is in scope; the answer is where the
+  ## *occurrence* under the cursor is, and the syntax index is the only thing that
+  ## knows. The fallback when that index has no node for the name is load-bearing
+  ## rather than incidental: an enum field is not a statement the parser records a
+  ## declaration for, so the row's own position is the only answer left, and
+  ## dropping it is what made post-dot completion return nothing at all.
+  let name = pool.symBasename(sym.id)
+  let source = if sym.info.file.isValid: realFile(pool.filenames[sym.info.file])
+               else: ""
+  let lineNo = sym.info.line.uint32.int
+  let column = sym.info.col.uint32.int
+  if not resolveAtCursor or source.len == 0:
+    return doc.symbolAtInfo(name, $sym.kind, lineNo, column, source)
+  if pool.symModule(sym.id) != moduleSuffix and source != doc.path:
+    # An import this file can see but not own: the syntax index only ever holds
+    # this document's nodes, so the row is the only answer.
+    return doc.symbolAtInfo(name, $sym.kind, lineNo, column, source)
+  let resolved = doc.resolveNameAt(name, queryLine, queryCharacter)
+  if resolved.len == 0:
+    return doc.symbolAtInfo(name, $sym.kind, lineNo, column, source)
+  result = doc.symbolAtInfo(name, $sym.kind, lineNo, column, source)
+  for id in resolved:
+    let n = doc.nodes[id]
+    result = SemanticSymbol(name: name, kind: $sym.kind, uri: doc.uri,
+      range: n.range,
+      doc: doc.docCommentAt(doc.path, n.range.startLine + 1,
+                            n.range.startCharacter, n.text))
+
+proc snapshotFromQuery*(doc: Document; res: IdeQueryResult; queryLine,
+                        queryCharacter: int): SemanticSnapshot {.raises.} =
+  ## The sidecar's reader, fed the struct instead of the text.
+  ##
+  ## This is `parseIdeSnapshot` over a different transport, and it is a second
+  ## implementation rather than a shared one: the sidecar is text on a wire and
+  ## the struct is not, so there is no single code path to factor out without
+  ## inventing a representation both could be lowered from -- which would be the
+  ## 6.4 MB TSV this exists to avoid.
+  ##
+  ## So the two are held to agreeing by `tests/lsp/boundary.nim`, which runs both
+  ## over one sem run and compares them field by field, in both modes. That is the
+  ## only thing making a second reader safe, and it is why the test exists.
+  result = SemanticSnapshot(queried: res.queried, matched: res.matched,
+                            documentMode: res.documentMode,
+                            visible: @[], candidates: @[], imports: @[],
+                            dotMembers: @[], signatures: @[], positions: @[])
+  if res.documentMode:
+    for pos in res.positions:
+      var symbols: seq[SemanticSymbol] = @[]
+      for sym in pos.candidates:
+        symbols.add doc.symbolForSym(sym, res.moduleSuffix, queryLine,
+                                      queryCharacter, resolveAtCursor = false)
+      result.positions.add IdePosition(line: pos.info.line.uint32.int,
+                                       column: pos.info.col.uint32.int,
+                                       name: pool.strings[pos.name],
+                                       symbols: symbols)
+  for sym in res.imports:
+    result.imports.add doc.symbolForSym(sym, res.moduleSuffix, queryLine,
+                                        queryCharacter, resolveAtCursor = false)
+  for sym in res.dotMembers:
+    result.dotMembers.add doc.symbolForSym(sym, res.moduleSuffix, queryLine,
+                                            queryCharacter,
+                                            resolveAtCursor = false)
+  for sig in res.signatures:
+    result.signatures.add SemanticSignature(name: pool.symBasename(sig.sym),
+                                           kind: $sig.kind, params: sig.params)
+  for sym in res.visible:
+    result.visible.add doc.symbolForSym(sym, res.moduleSuffix, queryLine,
+                                         queryCharacter, resolveAtCursor = true)
+  for sym in res.candidates:
+    result.candidates.add doc.symbolForSym(sym, res.moduleSuffix, queryLine,
+                                            queryCharacter,
+                                            resolveAtCursor = true)
+
+proc semInProcess*: bool =
+  ## Whether to answer queries by running sem inside this process.
+  ##
+  ## Off by default and read from the environment rather than a command-line flag
+  ## because the language server is started by an editor, not by a user who can
+  ## be asked to spell a flag correctly. `NIMONY_LSP_INPROCESS=1` turns it on.
+  ##
+  ## Off by default because in-process sem is still unproven on a real file over a
+  ## long session, and the subprocess path is the one that has been measured. This
+  ## is the switch that lets both run against the same corpus before either is
+  ## trusted.
+  let v = getEnv("NIMONY_LSP_INPROCESS")
+  v.len > 0 and v != "0"
+
+proc dependencyClosureReady(db: Database; doc: Document): bool =
+  ## Whether in-process sem can read this document's imports out of the cache.
+  ##
+  ## It cannot do its own dependency resolution: `deps.nim` is what walks the
+  ## import graph and sems each dependency, and that runs in `nifmake`, ahead of
+  ## sem proper. A subprocess does not care, because `nifmake` IS the thing that
+  ## arranges the closure. In-process has to be *told* the closure is there.
+  ##
+  ## So the test is deliberately coarse: has this document already been checked
+  ## once by the subprocess path? That run built the closure as a side effect, and
+  ## from then on in-process can read it. It does not try to verify the closure
+  ## itself. An earlier version walked the `.p.deps.nif` and checked each
+  ## `include`, which is wrong twice over: the file lists direct imports only,
+  ## not the transitive closure, so it reported a cold cache as ready; and it
+  ## picked up the `.vendor` and `.dialect` header strings as if they were
+  ## imports, so it reported a *warm* cache as cold. In-process was off in
+  ## practice while the flag said it was on -- which read as "wired up, no
+  ## speedup" until the timing was actually measured.
+  ##
+  ## It has to be a pre-flight and not a `try`. `vfs.openMmapImpl` answers a
+  ## missing interface with `quit`, which ends the process outright and which
+  ## nothing in the editor can catch: the first cold query killed the server
+  ## rather than falling back.
+  result = false
+  if not os.fileExists(db.cacheDir / (doc.moduleName & ".s.nif")): return false
+  # `std/system` is imported implicitly rather than listed, and it is the one
+  # import sem always needs.
+  if not os.fileExists(db.cacheDir / (SystemModuleSuffix & ".s.nif")): return false
+  result = true
+
+proc runSemInProcess*(db: Database; doc: Document;
+                      line, character: int): IdeQueryResult {.raises.} =
+  ## One sem run, in this process, over `doc`'s already-parsed tree.
+  ##
+  ## The parsed `.p.nif` is written by `updateDocument` on every change, which is
+  ## cheap because it is only the parse output. sem reads it and does the work
+  ## that used to require `fork`/`exec` of `bin/nimony` plus a second parse of
+  ## the sidecar text.
+  ##
+  ## Three constraints, all found by running this rather than by reading it:
+  ##
+  ## - `stdlibFile` resolves against the *executable's* parent directory. This
+  ##   binary is `bin/nimony-lsp`, so that happens to be right, but it is a
+  ##   coincidence of where the file sits and not something to rely on.
+  ## - `setupPaths` must be called or every module suffix is computed against no
+  ##   search path and names a `.s.nif` nobody wrote.
+  ## - The dependency closure must already be semmed into the cache. `deps.nim`
+  ##   does that in `nifmake`, ahead of sem; in-process skips it. On a cache that
+  ##   has never been built this fails on the first import, which is why the
+  ##   subprocess path stays available as a fallback rather than this being the
+  ##   only way to answer a query.
+  setProjectRoot(db.root)
+  var config = initNifConfig(db.root)
+  config.nifcachePath = db.cacheDir
+  config.setupPaths()
+  # Built as a `seq` rather than an array literal: mixing a `seq[string]` into
+  # one infers a nested element type, and the error it reports points at the
+  # literal rather than at the mix.
+  var paths: seq[string] = @[db.root, db.root / "lib", db.root / "src" / "lib"]
+  for p in db.modulePaths: paths.add p
+  # The open document's own directory, which `runCompiler` also passes as
+  # `--path:`. A `./`-less sibling import (`import sibling_dep_helper`) resolves
+  # against the *importing* file's directory, so without this it resolves to
+  # nothing: sem creates the node with no parse rule and the build dies on a
+  # missing interface. Same reason, same fix -- kept here because the two paths
+  # build their search paths separately and would otherwise drift.
+  let docDir = parentDir(doc.path)
+  if docDir.len > 0: paths.add docDir
+  config.paths = paths
+  # Line 0 is document mode: every identifier occurrence in one pass, which is
+  # what `runDiagnostics` wants. A real line asks about one position, which is
+  # what a cursor query wants.
+  if line < 0:
+    config.toTrack = TrackPosition(mode: TrackVisible, line: 0, col: 0,
+                                   filename: doc.path)
+  else:
+    let offset = doc.positionOffset(line, character)
+    var lineStart = offset
+    while lineStart > 0 and doc.text[lineStart - 1] != '\n': dec lineStart
+    config.toTrack = TrackPosition(mode: TrackVisible, line: (line + 1).int32,
+                                   col: (offset - lineStart + 1).int32,
+                                   filename: doc.path)
+  # The sidecar is still written -- `writeIdeQuery` runs inside `semcheckCore` --
+  # and left in place deliberately for now. It is what `semanticErrors` reads,
+  # and the boundary test compares the struct against it. Removing it is the next
+  # step, and it needs errors to travel in the struct first.
+  result = semcheckInProcess(@[doc.parsedFile],
+                             @[db.cacheDir / (doc.moduleName & ".s.nif")],
+                             config, {}, "", "", false)
+
 proc ideQueryAt*(db: Database; doc: Document; line, character: int;
                  memberRequest = false;
                  needCursorQuery = false): SemanticSnapshot {.raises.} =
@@ -865,6 +1111,21 @@ proc ideQueryAt*(db: Database; doc: Document; line, character: int;
                             visible: @[], candidates: @[])
   doc.queryLine = line
   doc.queryCharacter = character
+  if semInProcess() and db.dependencyClosureReady(doc):
+    try:
+      let res = db.runSemInProcess(doc, line, character)
+      if not res.documentMode:
+        result = snapshotFromQuery(doc, res, line, character)
+        doc.queryCached = true
+        doc.queryResult = result
+        return
+      # Document mode answers from the recorded occurrences instead, which is the
+      # path below and costs no compile at all.
+    except:
+      # The exception's message is not reachable from a bare `except` in this
+      # stdlib, so the fallback reason is logged without it. stderr, because
+      # stdout is the JSON-RPC transport.
+      stderr.writeLine "[nimony-lsp] in-process sem failed, falling back to the subprocess"
   let content = db.runCompiler(doc)
   if content.sidecar.len > 0: result = parseIdeSnapshot(doc, content.sidecar, line, character)
   doc.queryCached = true
