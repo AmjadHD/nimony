@@ -71,6 +71,18 @@ type
     queryCached*: bool
     queryLine*, queryCharacter*: int
     queryResult*: SemanticSnapshot
+    ## `##` blocks of the OPEN document, keyed by the line a block STARTS on.
+    ##
+    ## The parser hands these over keyed by a block's LAST line, which is a
+    ## different key, and the lookup this replaces walked the whole table per
+    ## call. Derived once per document version rather than kept as a second shape,
+    ## so the two keys cannot drift apart.
+    openDocs*: Table[int, string]
+    ## Indexes of every OTHER file this document's queries have touched. Held on
+    ## the document and dropped with it, so an edit to any file cannot leave a
+    ## stale index behind: the invalidation is "a newer version exists", not a
+    ## freshness check somebody has to get right.
+    otherFiles*: OtherFiles
 
   Database* = object
     root*, cacheDir*: string
@@ -293,6 +305,13 @@ proc updateDocument*(db: var Database; uri, path: string; version: int;
   p.keepComments = true
   parseModule p
   doc.docComments = p.docComments
+  doc.openDocs = initTable[int, string]()
+  for key, text in p.docComments:
+    if text.len > 0:
+      doc.openDocs[docBlockFirstLine(text, key)] = text
+  # A new version, so a fresh set of other-file indexes: any file that changed
+  # under an open buffer has changed without anything telling us.
+  doc.otherFiles = OtherFiles(byPath: initTable[string, FileIndex]())
   doc.diagnostics = p.errors
   let tree = finish(p)
   doc.nifTree = toString(tree)
@@ -514,28 +533,90 @@ proc docBlockFirstLine(text: string; lastLine: int): int =
     if ch == '\n': dec first
   first
 
-proc docCommentStartingAt(text: string; startLine: int): string =
-  ## The `##` block beginning on 1-based `startLine`, or `""`.
+type
+  FileIndex* = object
+    ## One source file, read and lexed once.
+    ##
+    ## `docs` and `lineStarts` are the two things that were recomputed on every
+    ## single lookup: the `##` block index cost a whole-file lexer pass per call,
+    ## and a column cost a scan from byte 0. Both are a single pass here, and
+    ## every lookup after that is a table or array read.
+    text*: string
+    lines*: seq[string]
+    docs*: Table[int, string]  ## line the block STARTS on -> the block
+    lineStarts*: seq[int]      ## 0-based line index -> byte offset of its start
+
+  OtherFiles* = ref object
+    ## Per-file indexes, shared by every copy of one `Document`.
+    ##
+    ## A `ref` rather than a plain field because `Document` is copied on every
+    ## update -- `updateDocument` builds a fresh one and hands back a value -- so
+    ## a by-value table would be discarded on each keystroke and the cache would
+    ## never survive to its second lookup.
+    byPath*: Table[string, FileIndex]
+
+proc buildFileIndex(text: string): FileIndex =
+  ## `text` split, offset-indexed and lexed for its `##` blocks, in one pass each.
+  result = FileIndex(text: text, docs: initTable[int, string](),
+                     lineStarts: @[], lines: @[])
+  var offset = 0
+  for line in text.splitLines():
+    result.lineStarts.add offset
+    result.lines.add line
+    offset += line.len + 1
+  # The project's own lexer, which is what makes this agree with what the parser
+  # recorded for the open document: a `##[` run, a blank `##` between paragraphs
+  # and the author's indentation all come out the same on both paths. A line scan
+  ## could only recognise a line beginning with `##`, so a block comment would
+  ## contribute just its opening line -- and matching that by hand is how two
+  ## readers drift apart in the first place.
   ##
-  ## Read with the project's own lexer, which is what makes the two paths agree.
-  ## The open document's text is that lexer's merged token, so a `##[` run, a
-  ## blank `##` between paragraphs and the author's indentation come out here
-  ## exactly as they do there. The previous line scan could only recognise a
-  ## line beginning with `##`, so a block comment contributed just its opening
-  ## line and the rest was lost -- and matching that by hand is how the two paths
-  ## drift in the first place.
-  ##
-  ## `openLexer` interns nothing into the symbol pool, so this is safe to call per
-  ## query. It is one pass over text the caller has already read from disk.
+  ## Keyed by the line a comment STARTS on, which is the line a caller asks about;
+  ## the parser keys its own table by the line a block ENDS on.
   var lex = openLexer(text)
   var tok = Token(kind: tkInvalid, s: "", indent: -1, spacing: {},
-                 line: 0, col: 0, base: 10, suffixPos: -1)
+                  line: 0, col: 0, base: 10, suffixPos: -1)
   next lex, tok
   while tok.kind != tkEof:
-    if tok.kind == tkComment and int(tok.line) == startLine:
-      return tok.s
+    if tok.kind == tkComment and tok.s.len > 0:
+      result.docs[int(tok.line)] = tok.s
     next lex, tok
-  ""
+
+
+proc fileIndex(doc: Document; path: string): FileIndex =
+  ## The index for `path`, read and lexed once per document version.
+  ##
+  ## Memoized on the document, so the second query about the same file is a table
+  ## read. That is the whole point: an editor asks about the same handful of
+  ## stdlib files over and over, and re-reading and re-lexing each of them per
+  ## symbol is what made this quadratic in the size of the answer.
+  ##
+  ## A miss reads from disk and lexes; an unreadable or empty file is cached as an
+  ## empty index rather than retried, so a broken path costs one attempt per
+  ## document version instead of one per symbol.
+  if doc.otherFiles == nil:
+    doc.otherFiles = OtherFiles(byPath: initTable[string, FileIndex]())
+  # `hasKey` then `[]`, inside a `try`: this stdlib marks the indexing operator as
+  # `.raises`, and a hit has to hand the stored record back by value. Reading it
+  # through `getOrDefault` instead would work, but then an EMPTY index -- an
+  # unreadable or zero-length file -- could not be told from a miss, and the cache
+  # would re-read that path once per symbol, which is the behaviour this exists to
+  # remove.
+  try:
+    if doc.otherFiles.byPath.hasKey(path): return doc.otherFiles.byPath[path]
+  except:
+    discard
+  # Contained here rather than propagated: an unreadable file means "no doc
+  ## comments", which is an answer, not an error. Letting it escape would mark
+  # every lookup -- and every handler behind it -- as `.raises.` for a case that
+  ## already has a correct answer.
+  var text = ""
+  try:
+    text = readFile(path)
+    result = buildFileIndex(text)
+  except:
+    result = buildFileIndex("")
+  doc.otherFiles.byPath[path] = result
 
 proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
                    name: string): string =
@@ -562,34 +643,33 @@ proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
   ## copy for another open-but-unsaved buffer, and it cannot see a `##[` block.
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
   if path == doc.path:
-    # The table is keyed by a block's LAST line, so the block that documents
-    # this declaration is the one *starting* below it. Its first line is its key
-    # minus its interior newlines, which the merged text already carries.
+    # `lineNo` arrives 1-based from some call sites and 0-based from others, so
+    # the line below the declaration is looked for under both readings.
     for line in [lineNo, lineNo + 1]:
-      for key, text in doc.docComments:
-        if text.len > 0 and docBlockFirstLine(text, key) == line:
-          return text
-  var text = ""
-  if path == doc.path: text = doc.text
-  else:
-    try: text = readFile(path)
-    except: discard
-  if text.len == 0: return ""
-  # Another file's text, so the block is found by scanning down from the
-  # declaration, the same direction the table lookup above uses. A signature
-  # that wraps over several lines is skipped by bracket depth, so the block is
-  # still found under the first statement of the body.
-  let lines = text.splitLines()
-  var index = max(0, min(lineNo - 1, lines.len - 1))
+      let found = doc.openDocs.getOrDefault(line)
+      if found.len > 0: return found
+    return ""
+  let index = doc.fileIndex(path)
+  if index.text.len == 0: return ""
+  # Scanned down from the declaration, the same direction as above: a signature
+  # wrapping over several lines is skipped by bracket depth, so the block is still
+  # found under the first statement of the body.
+  # Stepped exactly as the one-shot version stepped, because the off-by-one is
+  # load-bearing rather than incidental: `i` is advanced BEFORE the depth test, so
+  # the break leaves it one line past the declaration, and the block is then
+  # looked for one line further still. Rewriting that as "find the first line at
+  # depth zero" looks equivalent and is not -- it lost every cross-file `##`
+  # block, which is what the suite caught.
+  var i = max(0, min(lineNo - 1, index.lines.len - 1))
   var depth = 0
-  while index < lines.len:
-    for ch in lines[index]:
+  while i < index.lines.len:
+    for ch in index.lines[i]:
       if ch in {'(', '[', '{'}: inc depth
       elif ch in {')', ']', '}'}: dec depth
-    inc index
+    inc i
     if depth > 0: continue
     break
-  docCommentStartingAt(text, index + 1)
+  index.docs.getOrDefault(i + 1)
 
 proc positionOffset(doc: Document; line, character: int): int =
   result = 0
@@ -603,33 +683,36 @@ proc positionOffset(doc: Document; line, character: int): int =
     width += utf16Width(doc.text[result])
     inc result
 
-proc utf16Column(text: string; line, byteColumn: int): int =
+proc utf16ColumnTo(text: string; byteColumn: int): int =
+  ## UTF-16 width of `text[0 ..< byteColumn]`, where `byteColumn` is an offset
+  ## from the START OF THE LINE.
+  ##
+  ## The prefix, not the whole line: everything past the column cannot affect the
+  ## answer, and counting it was pure waste. Its predecessor took `(text, line,
+  ## byteColumn)` and found the line by walking newlines from byte 0, which is
+  ## what made a column lookup cost a whole file -- and the caller had already
+  ## located that line by other means.
   result = 0
-  var currentLine = 1
-  var offset = 0
-  while offset < text.len and currentLine < line:
-    if text[offset] == '\n': inc currentLine
-    inc offset
-  let lineEnd = min(text.len, offset + max(0, byteColumn))
-  while offset < lineEnd:
-    result += utf16Width(text[offset])
-    inc offset
+  let limit = min(text.len, max(0, byteColumn))
+  var i = 0
+  while i < limit:
+    result += utf16Width(text[i])
+    inc i
 
 proc sourceRange(doc: Document; source: string; line, col: int;
                  name: string): SourceRange {.raises.} =
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
-  var text = ""
-  if path == doc.path: text = doc.text
-  else:
-    try: text = readFile(path)
-    except: discard
+  let index = if path == doc.path: buildFileIndex(doc.text)
+              else: doc.fileIndex(path)
+  let text = index.text
   var byteColumn = col
   if text.len > 0 and name.len > 0:
-    var start = 0
-    var currentLine = 1
-    while start < text.len and currentLine < line:
-      if text[start] == '\n': inc currentLine
-      inc start
+    # From the offset index rather than by counting newlines from byte 0. The
+    # scan this replaces was O(file) per symbol, and it ran twice -- once here
+    # and once more inside `utf16Column` -- so it was the second-largest cost in
+    # the whole query path.
+    let lineIdx = max(0, min(line - 1, index.lineStarts.len - 1))
+    let start = index.lineStarts[lineIdx]
     var stop = start
     while stop < text.len and text[stop] != '\n': inc stop
     var i = min(stop, start + max(0, col))
@@ -649,7 +732,9 @@ proc sourceRange(doc: Document; source: string; line, col: int;
     for c in name: nameWidth += utf16Width(c)
     width = nameWidth
   let lineNo = max(0, line - 1)
-  let column = if text.len > 0: utf16Column(text, line, byteColumn) else: col
+  # Only the bytes up to the column need counting to get UTF-16 units; the rest of
+  # the line does not, so this is a prefix scan and not a whole-line one.
+  let column = if text.len > 0: utf16ColumnTo(text, byteColumn) else: col
   SourceRange(startLine: lineNo, startCharacter: column,
               endLine: lineNo, endCharacter: column + width)
 
