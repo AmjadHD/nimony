@@ -773,10 +773,31 @@ proc uriForPath*(doc: Document; source: string): string =
 
 proc resolveNameAt(doc: Document; name: string; line, character: int): seq[int]
 
-proc symbolFromFields(doc: Document; fields: seq[string]): SemanticSymbol {.raises.} =
-  ## `candidate` and `import` rows share a shape: name, kind, file, line, col,
-  ## is-local.
+proc symbolFromFields(doc: Document; fields: seq[string];
+                      withSource: bool): SemanticSymbol {.raises.} =
+  ## `candidate`, `import`, `visible` and `dotmember` rows share a shape: name,
+  ## kind, file, line, col, is-local.
+  ##
+  ## `withSource` decides whether the declaration's `uri`, `##` documentation and
+  ## range are resolved at all, and it is the difference between one lookup per
+  ## symbol and one per *answer*. Every field beyond name and kind costs a file
+  ## index and a column lookup, and a document-mode import table is thousands of
+  ## rows -- on the corpus this was written against, 2,043 `import` rows against
+  ## 93 `candidate` rows.
+  ##
+  ## So it comes down to which handler reads them. Hover and go-to-definition read
+  ## `candidates`, and need the documentation and the range. Completion reads
+  ## `imports`, `visible` and `dotMembers`, and reads NOTHING but `name` and
+  ## `kind` -- it builds a label and a detail string. Computing a doc comment for
+  ## a name the client will only ever display as a word is 99% waste, and it was
+  ## the largest remaining cost in the query path.
+  ##
+  ## Not lazy, which would be the general fix: a lazy field needs a `var` accessor
+  ## and every call site rewritten, and the split here is knowable statically from
+  ## the row type. That is a judgement, not a proof -- if a handler later wants the
+  ## range of an `import`, it must come back here rather than find it empty.
   result = SemanticSymbol(name: fields[1], kind: fields[2], uri: "", doc: "")
+  if not withSource: return
   let source = if fields[3].len > 0: realFile(fields[3]) else: ""
   if source.len == 0: return
   result.uri = doc.uriForPath(source)
@@ -817,12 +838,12 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
         let candidate = rows[i].split('\t')
         inc i
         if candidate.len >= 7 and candidate[0] == "candidate":
-          symbols.add doc.symbolFromFields(candidate)
+          symbols.add doc.symbolFromFields(candidate, true)
       result.positions.add IdePosition(line: lineNo, column: column,
                                        name: unescapeTsv(fields[3]),
                                        symbols: symbols)
     elif fields.len >= 7 and fields[0] == "import":
-      result.imports.add doc.symbolFromFields(fields)
+      result.imports.add doc.symbolFromFields(fields, false)
     elif fields.len >= 4 and fields[0] == "signature":
       # Keyed by name and params, not by position: there is no identifier at the
       # cursor mid-call -- the callee's name is behind it. So this cannot use the
@@ -839,11 +860,9 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
         column = parseInt(fields[5])
       except:
         continue
-      let source = if fields[3].len > 0: realFile(fields[3]) else: ""
+      # Member completion reads name and kind only -- see `symbolFromFields`.
       result.dotMembers.add SemanticSymbol(name: fields[1], kind: fields[2],
-        uri: doc.uriForPath(source),
-        range: doc.sourceRange(source, lineNo, column, fields[1]),
-        doc: doc.docCommentAt(source, lineNo, column, fields[1]))
+        uri: "", range: SourceRange(), doc: "")
     elif fields.len >= 7 and fields[0] == "visible":
       var lineNo, column = 0
       try:
@@ -852,6 +871,11 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
       except:
         continue
       let source = if fields[3].len > 0: realFile(fields[3]) else: ""
+      # `visible` rows go to completion and are wanted as a name and a kind;
+      # `candidate` rows go to hover and go-to-definition, which is why both
+      # arrive through this one branch and why the cost cannot be decided here
+      # once for both. See `symbolFromFields`.
+      let needSource = fields[0] != "visible"
       let isLocal = fields[6] == "true"
       if isLocal or source == doc.path:
         let resolved = doc.resolveNameAt(fields[1], queryLine, queryCharacter)
@@ -861,33 +885,45 @@ proc parseIdeSnapshot(doc: Document; content: string; queryLine,
           # records a declaration for. The row already carries the declaration's
           # own file, line and column, so use those rather than dropping it --
           # dropping is what made post-dot completion answer nothing at all.
-          let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
-            uri: doc.uriForPath(source),
-            range: doc.sourceRange(source, lineNo, column, fields[1]),
-            doc: doc.docCommentAt(source, lineNo, column, fields[1]))
-          if fields[0] == "visible": result.visible.add symbol
-          else: result.candidates.add symbol
+          var symbol = SemanticSymbol(name: fields[1], kind: fields[2], uri: "", doc: "",
+                                    range: SourceRange())
+          if needSource:
+            symbol.uri = doc.uriForPath(source)
+            symbol.range = doc.sourceRange(source, lineNo, column, fields[1])
+            symbol.doc = doc.docCommentAt(source, lineNo, column, fields[1])
+          addSymbol(result, fields[0], symbol)
           continue
         for id in resolved:
           let n = doc.nodes[id]
-          let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
-            uri: doc.uri, range: n.range,
-            doc: doc.docCommentAt(doc.path, n.range.startLine + 1,
-                                  n.range.startCharacter, n.text))
-          if fields[0] == "visible": result.visible.add symbol
-          else: result.candidates.add symbol
-      elif source.len > 0:
-        let symbol = SemanticSymbol(name: fields[1], kind: fields[2],
+          # The range is already in hand -- it is the node's -- so only the
+          # documentation is a lookup, and only a `candidate` row wants one.
+          var symbol = SemanticSymbol(name: fields[1], kind: fields[2], uri: "", doc: "",
+                                    range: SourceRange())
+          if needSource:
+            symbol.uri = doc.uri
+            symbol.range = n.range
+            symbol.doc = doc.docCommentAt(doc.path, n.range.startLine + 1,
+                                          n.range.startCharacter, n.text)
+          addSymbol(result, fields[0], symbol)
+      elif source.len > 0 and needSource:
+        addSymbol(result, fields[0], SemanticSymbol(name: fields[1], kind: fields[2],
           uri: doc.uriForPath(source),
           doc: doc.docCommentAt(source, lineNo, column, fields[1]),
-          range: doc.sourceRange(source, lineNo, column, fields[1]))
-        if fields[0] == "visible": result.visible.add symbol
-        else: result.candidates.add symbol
+          range: doc.sourceRange(source, lineNo, column, fields[1])))
       else:
-        let symbol = SemanticSymbol(name: fields[1], kind: fields[2], uri: "",
-                                    range: SourceRange())
-        if fields[0] == "visible": result.visible.add symbol
-        else: result.candidates.add symbol
+        # A `visible` row falls through to here too, and wants no source at all.
+        addSymbol(result, fields[0], SemanticSymbol(name: fields[1], kind: fields[2], uri: "", doc: "",
+                                    range: SourceRange()))
+
+proc addSymbol(snapshot: var SemanticSnapshot; row: string;
+               symbol: SemanticSymbol) =
+  ## Route by row type. `visible` is what completion lists; `candidate` is what
+  ## hover and go-to-definition read. Kept as one proc because it used to be
+  ## spelled out at four call sites, and while narrowing the expensive fields to
+  ## the rows that need them I briefly sent every row to `visible` -- which is the
+  ## kind of mistake this exists to make impossible to repeat.
+  if row == "visible": snapshot.visible.add symbol
+  else: snapshot.candidates.add symbol
 
 proc ideQueryAt*(db: Database; doc: Document; line, character: int;
                  memberRequest = false;
