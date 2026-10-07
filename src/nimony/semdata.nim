@@ -169,8 +169,53 @@ type
                     ## knows whether this is a proc or an iterator
     params*: string
 
+  IdeQueryResult* = object
+    ## An editor query that outlives the run that produced it.
+    ##
+    ## Not `IdeQuery`. That struct holds `inferred: Table[SymId, Cursor]`, whose
+    ## cursors point into token buffers that are locals of `semcheckCore` -- handing
+    ## the whole thing out would hand out a dangling field, and a caller that
+    ## touched it would fault rather than fail. Every field here is a plain value or a
+    ## seq of them, so the result is safe to keep after the context is gone.
+    ##
+    ## This is also the boundary the editor should program against rather than sem's
+    ## internal query state, which is what lets the two change independently.
+    queried*, matched*, documentMode*: bool
+    ## The suffix of the module that was checked. A reader needs it to tell a
+    ## symbol declared in this file from one merely visible in it -- the same
+    ## `pool.symModule(id) == thisModuleSuffix` test `writeIdeQuery` applies per
+    ## row, which cannot be recovered from a `SymId` alone once the run is over.
+    moduleSuffix*: string
+    visible*, candidates*, imports*, dotMembers*: seq[IdeSymbol]
+    signatures*: seq[IdeSignature]
+    positions*: seq[IdeResolution]
+    ## What sem reported, so a consumer that cannot read stdout still learns
+    ## where and what. The sidecar carried these as `error` rows; without them
+    ## here the editor has to keep reading that file, and then the whole point of
+    ## not writing it is lost.
+    ##
+    ## Plain values rather than `ErrorRecord`s because those hold a
+    ## `NifLineInfo`, whose `file` is a `FileId` into the pool -- interned for the
+    ## run, meaningless after it, the same hazard `IdeQuery.inferred` poses.
+    errors*: seq[IdeError]
+
+  IdeError* = object
+    ## One reported error, as the editor needs it.
+    file*: string
+    line*, col*: uint32
+    msg*: string
+
   IdeQuery* = object
     enabled*, matched*, documentMode*: bool
+    ## Whether `writeIdeQuery` should write the sidecar file at all.
+    ##
+    ## Off is for a host that reads `IdeQueryResult` and has no use for the text.
+    ## The sidecar is not small -- every identifier occurrence in a large file,
+    ## each with its resolution -- and writing it per query is most of the I/O an
+    ## in-process design was meant to remove. It stays on by default because
+    ## `nimony check --visible:` is a batch feature whose output IS that file, and
+    ## turning it off by default would silently change what the batch tool emits.
+    writeSidecar*: bool
     info*: NifLineInfo
     name*: StrId
     visible*, candidates*: seq[IdeSymbol]

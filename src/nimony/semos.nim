@@ -6,6 +6,9 @@
 
 ## Path handling and `exec` like features as `sem.nim` needs it.
 
+when defined(nimony):
+  {.feature: "assumeSync".}  # compiler-internal globals; single threaded
+
 from std / strutils import multiReplace, startsWith
 from std / algorithm import sort
 import std / [tables, sets, os, envvars, syncio, formatfloat, assertions, dirs, paths, times]
@@ -43,6 +46,25 @@ proc nimonyDir(): string =
 proc stdlibDir*(): string =
   result = nimonyDir() / "lib"
 
+var projectRoot* = ""
+
+proc setProjectRoot*(root: string) =
+  ## Tell the embedded compiler where the project tree is.
+  ##
+  ## Normally unnecessary: `nimonyDir` derives the root from this executable's
+  ## own parent directory, which is right for `bin/nimony` and for every tool
+  ## staged beside it. It is wrong for a host that *links* the compiler -- the
+  ## language server, or a test binary built into `nimcache/` -- because then
+  ## `stdlibFile("std/system")` names a tree with no `lib/` in it and the first
+  ## import dies on a missing interface. That failure is silent about its cause:
+  ## the `.s.nif` it reports missing was never named because the directory it
+  ## would have been written to does not exist.
+  ##
+  ## So an embedding host must say where the tree is. Left empty by default,
+  ## which means "derive it from the executable" and keeps every existing caller
+  ## unchanged.
+  projectRoot = root
+
 proc setupPaths*(config: var NifConfig) =
   config.paths.add stdlibDir()
   # Keep the compiler-internal `src/lib` modules (nifbuilder/nifreader, pulled
@@ -60,7 +82,12 @@ proc setupPaths*(config: var NifConfig) =
   #echo getAppFilename(), "CONFIG.BASEDIR: ", config.baseDir, " CONFIG.PATHS: ", config.paths
 
 proc stdlibFile*(f: string): string =
-  result = stdlibDir() / f
+  ## `f` resolved against the stdlib directory.
+  ##
+  ## `stdlibDir` is derived from the *executable's* location, so this only means
+  ## "the stdlib next to this binary". `setProjectRoot` overrides that for a host
+  ## that embeds the compiler somewhere else -- see the note there.
+  result = (if projectRoot.len > 0: projectRoot else: nimonyDir()) / "lib" / f
 
 proc compilerDir*(): string =
   let appDir = getAppDir()

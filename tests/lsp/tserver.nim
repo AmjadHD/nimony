@@ -1,4 +1,4 @@
-import std / [assertions, os, strutils, syncio, uri]
+import std / [assertions, os, strutils, syncio, uri, envvars, tables]
 import ../../src/lsp/[database, handlers]
 
 proc uriPathForTest(uriText: string): string {.raises.} =
@@ -35,7 +35,17 @@ proc assertWellFormed(response, label: string) =
   assert depth == 0,
          label & " is " & $(-depth) & " brace(s) out of balance: " & response
 
-proc runTests() {.raises.} =
+proc note(responses: var Table[string, string]; label, response: string) =
+  ## One handler result, keyed by label, for the side-by-side comparison at the
+  ## end. A flat proc rather than a closure over `responses`: the closure would
+  ## need `{.closure.}`, and a flat one threads the table through explicitly.
+  responses[label] = response
+
+proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} =
+  ## The request sequence. Run twice -- once per sem path -- with every response
+  ## recorded, so the two paths can be compared rather than each merely being
+  ## self-consistent.
+  putEnv("NIMONY_LSP_INPROCESS", if inProcess: "1" else: "0")
   var db = initDatabase(getCurrentDir())
 
   # A definition into another module hands the client a URI. It has to be one
@@ -43,6 +53,7 @@ proc runTests() {.raises.} =
   # are percent-encoded -- and encoding must not depend on what the HOST thinks
   # is absolute, or a Windows path gets grafted onto the workspace root.
   let uriDoc = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/plain.nim","version":1,"text":"let x = 1\n"}}}""")
+  note(responses, "uriDoc", uriDoc.response)
   discard uriDoc
   let plain = db.document("file:///workspace/plain.nim")
   let cases = [
@@ -85,7 +96,9 @@ proc runTests() {.raises.} =
 
   let docUri = "file:///workspace/lsp-docs.nim"
   let openedDocs = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim","languageId":"nim","version":1,"text":"proc double*(x: int): int =\n  ## Doubles x.\n  ##\n  ## Second line.\n  x * 2\n\nproc use() =\n  discard double(2)\n"}}}""")
+  note(responses, "openedDocs", openedDocs.response)
   let docsHover = handle(db, """{"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-docs.nim"},"position":{"line":7,"character":12}}}""")
+  note(responses, "docsHover", docsHover.response)
   assert docsHover.response.contains("proc double")
   assert docsHover.response.contains("Doubles x.")
   assert docsHover.response.contains("Second line.")
@@ -94,22 +107,27 @@ proc runTests() {.raises.} =
 
   let uri = "file:///workspace/lsp-test.nim"
   let opened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim","version":1,"text":"let broken = (1\nlet typedBroken: UnknownType = 1\nimport std/strutils\nlet global = 1\nproc f() =\n  let global = 2\n  let local = global\n  let found = contains(\"x\", \"x\")\n  local\n  global.\n  \n"}}}""")
+  note(responses, "opened", opened.response)
   assert opened.notification.contains("publishDiagnostics")
   assert opened.notification.contains("expected")
 
   let definition = handle(db, """{"jsonrpc":"2.0","id":1,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
+  note(responses, "definition", definition.response)
   assert definition.response.contains("\"line\":6")
   assert definition.response.contains("\"character\":6")
 
   let shadowed = handle(db, """{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":6,"character":16}}}""")
+  note(responses, "shadowed", shadowed.response)
   assert shadowed.response.contains("\"line\":5")
   assert shadowed.response.contains("\"character\":6")
 
   let importedDefinition = handle(db, """{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":7,"character":16}}}""")
+  note(responses, "importedDefinition", importedDefinition.response)
   assert importedDefinition.response.contains("lib/std/strutils.nim")
   assert importedDefinition.response.contains("\"character\":5")
 
   let hover = handle(db, """{"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
+  note(responses, "hover", hover.response)
   assert hover.response.contains("let local")
 
   # Document mode records every occurrence, so a position the cursor has never
@@ -135,17 +153,21 @@ proc runTests() {.raises.} =
     if position.symbols.len == 0: sawUnresolved = true
   assert sawUnresolved
   let revisited = handle(db, """{"jsonrpc":"2.0","id":21,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
+  note(responses, "revisited", revisited.response)
   assert revisited.response.contains("let local")
 
   let semanticCompletion = handle(db, """{"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
+  note(responses, "semanticCompletion", semanticCompletion.response)
   assert semanticCompletion.response.contains("\"label\":\"local\"")
   assert semanticCompletion.response.contains("\"label\":\"global\"")
   assert semanticCompletion.response.contains("\"label\":\"contains\"")
 
   let postDot = handle(db, """{"jsonrpc":"2.0","id":6,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":9,"character":9}}}""")
+  note(responses, "postDot", postDot.response)
   assert postDot.response.contains("\"items\":[]")
 
   let completion = handle(db, """{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":10,"character":2}}}""")
+  note(responses, "completion", completion.response)
   assert completion.response.contains("\"label\":\"local\"")
   assert completion.response.contains("\"label\":\"global\"")
 
@@ -156,6 +178,7 @@ proc runTests() {.raises.} =
   let cacheFile = db.document(uri).cacheFile
   assert cacheFile.contains("nimcache/lsp")
   let changed = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim","version":2},"contentChanges":[{"text":"let replacement = 7\n"}]}}""")
+  note(responses, "changed", changed.response)
   assert changed.notification.contains("publishDiagnostics")
   assert db.document(uri).version == 2
   assert db.document(uri).nodes.len > 0
@@ -178,12 +201,14 @@ proc runTests() {.raises.} =
   assert readFile("tests/lsp/fixtures/sibling_dep.nim").replace("\r\n", "\n") ==
     "import sibling_dep_helper\n\nproc useSibling*(): int =\n  siblingAnswer()\n"
   let sibOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim","languageId":"nim","version":1,"text":"import sibling_dep_helper\n\nproc useSibling*(): int =\n  siblingAnswer()\n"}}}""")
+  note(responses, "sibOpened", sibOpened.response)
   assert not sibOpened.notification.contains("semantic analysis failed"),
          "the sibling module's compile failed: " & sibOpened.notification
   assert db.document("tests/lsp/fixtures/sibling_dep.nim").snapshot.positions.len > 0,
          "the sibling document recorded no identifier occurrences"
 
   let sibHover = handle(db, """{"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
+  note(responses, "sibHover", sibHover.response)
   assert sibHover.response.contains("siblingAnswer"),
          "no hover for the sibling's symbol: " & sibHover.response
   # The helper is not the open document, so its text is read from disk and the
@@ -197,6 +222,7 @@ proc runTests() {.raises.} =
          "cross-file hover lost the block's first line: " & sibHover.response
 
   let sibDef = handle(db, """{"jsonrpc":"2.0","id":91,"method":"textDocument/definition","params":{"textDocument":{"uri":"tests/lsp/fixtures/sibling_dep.nim"},"position":{"line":3,"character":3}}}""")
+  note(responses, "sibDef", sibDef.response)
   assert sibDef.response.contains("sibling_dep_helper.nim"),
          "definition did not reach the sibling: " & sibDef.response
 
@@ -265,6 +291,7 @@ proc runTests() {.raises.} =
   let overloadText = "proc useOverload*(s: string) =\n  s.add('x')\n"
   let overloadUri = "file:///workspace/lsp-overload.nim"
   let overloadOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-overload.nim","languageId":"nim","version":1,"text":"proc useOverload*(s: string) =\n  s.add('x')\n"}}}""")
+  note(responses, "overloadOpened", overloadOpened.response)
   assert not overloadOpened.notification.contains("semantic analysis failed"),
          "the overload fixture failed to compile: " & overloadOpened.notification
   let overloadDoc = db.document(overloadUri)
@@ -295,6 +322,7 @@ proc runTests() {.raises.} =
          "hover answered from the overload set's first candidate: " &
          addHover.response
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-overload.nim"}}}""")
+  note(responses, "addHover", addHover.response)
 
   # Completion after a dot, from the receiver's established type. This is the
   # first of Phase 2v2's criteria that needs no overload resolution at all: the
@@ -382,6 +410,7 @@ proc runTests() {.raises.} =
          "a partial member name fell back to the scope chain: " &
          partialComplete.response
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim"}}}""")
+  note(responses, "partialComplete", partialComplete.response)
 
   # An object receiver, end to end. `members.nim` checks the rows the sidecar
   # carries; this checks what the client actually receives, which is a different
@@ -405,6 +434,7 @@ proc runTests() {.raises.} =
          "object member completion offered a name from outside the receiver: " &
          objComplete.response
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-object.nim"}}}""")
+  note(responses, "objComplete", objComplete.response)
 
   # What a member completion costs. The cursor query spawns a `nimony check`, and
   # the query cache is keyed on an exact line and column -- so the sequence a user
@@ -414,6 +444,7 @@ proc runTests() {.raises.} =
   var partialDoc2 = db.document(partialUri)
   discard partialDoc2
   let partialOpen = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-dot-partial.nim","languageId":"nim","version":1,"text":"type Color = enum\n  colRed, colGreen, colBlue\n\nproc partial(k: Color) =\n  discard k\n  Color.co\n"}}}""")
+  note(responses, "partialOpen", partialOpen.response)
   discard partialOpen
   # The same query against a module that imports something real. What decides the
   # deferral is not the root module's size but whether sem has to re-resolve the
@@ -450,6 +481,7 @@ proc runTests() {.raises.} =
   # spawn directly rather than inferring it from a timing.
   let blankUri = "file:///workspace/lsp-blank.nim"
   let blankOpened = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-blank.nim","languageId":"nim","version":1,"text":"## only a note\n"}}}""")
+  note(responses, "blankOpened", blankOpened.response)
   assert not blankOpened.notification.contains("semantic analysis failed"),
          "the blank fixture failed to compile: " & blankOpened.notification
   let blank = db.document(blankUri)
@@ -476,7 +508,37 @@ proc runTests() {.raises.} =
   assert not nestedHover.response.contains("Documents this declaration"),
          "a later declaration took the block above it: " & nestedHover.response
 
+proc runBothPaths() {.raises.} =
+  ## The same request sequence down both sem paths, and the answers compared.
+  ##
+  ## Every assertion above holds for whichever path this run took, and that is not
+  ## the same as the two paths agreeing. They are separate readers over separate
+  ## transports -- the sidecar text and the query struct -- and nothing held them
+  ## to each other, so `snapshotFromQuery` came to resolve a shadowed name to the
+  ## outer declaration while the sidecar reader found the inner one. Both passed
+  ## their own assertions; only running the same sequence twice showed the
+  ## disagreement.
+  ##
+  ## The second run needs a warm cache: in-process sem reads the dependency
+  ## interfaces a subprocess run builds, and on a cold cache the first request
+  ## legitimately falls back. That is the fallback working, not a difference in
+  ## the answers.
+  var viaSubprocess: Table[string, string] = initTable[string, string]()
+  runTests(viaSubprocess, false)
+  var viaInProcess: Table[string, string] = initTable[string, string]()
+  runTests(viaInProcess, true)
+  putEnv("NIMONY_LSP_INPROCESS", "0")
+
+  assert viaSubprocess.len == viaInProcess.len,
+         "the two paths answered " & $viaSubprocess.len & " and " &
+         $viaInProcess.len & " requests, so they cannot be compared"
+  for label, want in viaSubprocess:
+    let got = viaInProcess.getOrDefault(label)
+    assert got == want,
+           label & " differs between the paths:\n  subprocess: " & want &
+           "\n  in-process: " & got
+
 try:
-  runTests()
+  runBothPaths()
 except:
   assert false, "LSP handler test raised unexpectedly"
