@@ -412,13 +412,21 @@ when defined(posix):
     proc symlink*(a1, a2: cstring): cint {.importc: "symlink".}
 
   # Directory operations
-  when defined(linux):
+  when defined(linux) and not defined(android):
     # `opendir`/`readdir`/`closedir` are libc functions (`DIR` is an opaque libc
     # buffer), not syscalls, so on Linux they are reimplemented on top of
     # open(2) + getdents64(2) + close(2) for every configuration. `Dirent`
     # keeps the same two fields (`d_type`, `d_name`) the consumers read, but
     # with a native layout — its bytes are copied out of the raw
     # `struct linux_dirent64` records.
+    #
+    # Android is excluded on purpose. Bionic is a Linux libc in the sense that
+    # `defined(linux)` is set, but it does NOT export `getdents64`: it is not
+    # among its public symbols, so binding it here produced an object that
+    # fails to LINK (`undefined symbol: getdents64`) rather than one that fails
+    # at run time. Bionic does export the real `opendir`/`readdir`/`closedir`,
+    # and its `struct dirent` is the same 64-bit-inode record the glibc
+    # reimplementation parses, so the branch below uses those instead.
     const
       O_DIRECTORY = (when defined(arm64): cint(0o40000) else: cint(0o200000))
         ## arm64 overrides the asm-generic value (its 0o200000 slot is
@@ -489,6 +497,28 @@ when defined(posix):
           inc i
         dirp.ent.d_name[i] = '\0'
         return addr dirp.ent
+  elif defined(android):
+    # Android/Bionic: the real libc functions. See the note on the branch above
+    # for why Android is not in it.
+    type
+      Dirent* {.pure.} = object ## Bionic `struct dirent`, 64-bit inode
+        d_ino: uint64           # offset 0
+        d_off: int64            # 8
+        d_reclen: uint16        # 16
+        d_type*: uint8          # 18
+        d_name*: array[256, char] # 19
+
+      DIR* {.pure.} = object ## opaque libc directory stream; only ever
+                             ## handled by pointer, never dereferenced here
+        opaque: pointer
+
+    # Bionic's `readdir` returns a pointer into libc's own buffer, valid until
+    # the next call, and skips the deleted-entry slots the glibc branch above
+    # has to filter itself. `std/dirs` reads `d_name` immediately, so handing
+    # the pointer straight back is correct here.
+    proc opendir*(name: cstring): nil ptr DIR {.importc: "opendir", sideEffect.}
+    proc readdir*(dirp: nil ptr DIR): nil ptr Dirent {.importc: "readdir", sideEffect.}
+    proc closedir*(dirp: nil ptr DIR): cint {.importc: "closedir", sideEffect.}
   elif defined(freebsd):
     # `Dirent` mirrors FreeBSD's 64-bit-inode `struct dirent` (FreeBSD 12+,
     # 280 bytes) — the record both libc's `readdir` and the `getdirentries`
