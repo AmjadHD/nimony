@@ -1366,7 +1366,7 @@ proc collectObjMembers(c: var SemContext; decl: TypeDecl; owner: SymId;
 proc objectMembers(c: var SemContext; decl: TypeDecl; info: NifLineInfo): seq[SymId] =
   ## Every field reachable through `decl`'s dot, own fields first.
   result = @[]
-  var seen: HashSet[StrId]
+  var seen: HashSet[StrId] = initHashSet[StrId]()
   # Judge visibility against the module the code was WRITTEN in, as the lookup
   # does -- a template body reaches sem in the consumer's module but a private
   # field belongs to the one that wrote it.
@@ -1443,7 +1443,9 @@ proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
       if objType.typeKind in {RefT, PtrT}: inc objType
       if objType.typeKind == ObjectT:
         members = objectMembers(c, decl, info)
-  members.add qualifiedEnumMembers(root)
+  # Appended one at a time: `add` on a seq here takes a single element, so handing it
+  # the whole seq does not concatenate.
+  for sym in qualifiedEnumMembers(root): members.add sym
   for sym in members:
     var ide = c.ideSymbol(dest, sym)
     ide.kind = EfldY

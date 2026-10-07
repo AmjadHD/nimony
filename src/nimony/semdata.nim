@@ -169,6 +169,22 @@ type
                     ## knows whether this is a proc or an iterator
     params*: string
 
+  IdeQueryResult* = object
+    ## An editor query that outlives the run that produced it.
+    ##
+    ## Not `IdeQuery`. That struct holds `inferred: Table[SymId, Cursor]`, whose
+    ## cursors point into token buffers that are locals of `semcheckCore` -- handing
+    ## the whole thing out would hand out a dangling field, and a caller that
+    ## touched it would fault rather than fail. Every field here is a plain value or a
+    ## seq of them, so the result is safe to keep after the context is gone.
+    ##
+    ## This is also the boundary the editor should program against rather than sem's
+    ## internal query state, which is what lets the two change independently.
+    queried*, matched*, documentMode*: bool
+    visible*, candidates*, imports*, dotMembers*: seq[IdeSymbol]
+    signatures*: seq[IdeSignature]
+    positions*: seq[IdeResolution]
+
   IdeQuery* = object
     enabled*, matched*, documentMode*: bool
     info*: NifLineInfo

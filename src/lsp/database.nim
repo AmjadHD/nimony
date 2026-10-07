@@ -704,8 +704,14 @@ proc symbolFromFields(doc: Document; fields: seq[string]): SemanticSymbol {.rais
   result.doc = doc.docCommentAt(source, lineNo, column, fields[1])
   result.range = doc.sourceRange(source, lineNo, column, fields[1])
 
-proc parseIdeSnapshot(doc: Document; content: string; queryLine,
-                      queryCharacter: int): SemanticSnapshot {.raises.} =
+proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
+                       queryCharacter: int): SemanticSnapshot {.raises.} =
+  ## Exported so a test can compare against the reader the editor really uses.
+  ## A second implementation of this format written in the test would only prove
+  ## it agrees with itself: had `escapeTsv` and `unescapeTsv` drifted apart,
+  ## matching them against a copy would pass while the sidecar had become
+  ## unreadable to the editor. Comparing the writer against this reader can only
+  ## fail when one of them is wrong.
   result = SemanticSnapshot(queried: true, matched: false,
                             visible: @[], candidates: @[])
   let rows = content.splitLines()

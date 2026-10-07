@@ -316,6 +316,41 @@ proc collectIdePositions*(c: var SemContext; dest: var TokenBuf) =
                    realFile(c.g.config.toTrack.filename))
   endRead(n)
 
+proc signaturesAt(info: NifLineInfo; all: seq[IdeSignature]): seq[IdeSignature] =
+  ## Only the call the cursor is inside. The bracket test upstream cannot distinguish
+  ## a one-line call from a call whose arguments span fifty lines: a cursor anywhere
+  ## between the first and last argument satisfies it, so a query inside such a call
+  ## collected that call's overloads *and* every other multi-line call enclosing the
+  ## same region. Observed on handlers.nim: five signatures, two of them duplicated,
+  ## none of them belonging to the call under the cursor.
+  ##
+  ## The innermost enclosing call is the one whose own position is the last at or
+  ## before the cursor. `callNodeInfo` is the callee's, so this picks the closest
+  ## preceding call rather than the nearest argument.
+  ##
+  ## Factored out of `writeIdeQuery` so the sidecar and the in-process result
+  ## answer the same question. When this lived only in the writer, the struct
+  ## carried every call's overloads while the text carried one call's -- not a
+  ## serialization difference but two different answers, which is worse than
+  ## either.
+  ##
+  ## Nothing at or before the cursor means the cursor is not inside a call, and the
+  ## answer is no signature at all -- not the whole file's worth of them.
+  result = @[]
+  var best = info
+  var bestValid = false
+  for sig in all:
+    if not sig.callAt.isValid: continue
+    if sig.callAt.line > best.line or
+       (sig.callAt.line == best.line and sig.callAt.col > best.col): continue
+    if not bestValid or sig.callAt.line > best.line or
+       (sig.callAt.line == best.line and sig.callAt.col >= best.col):
+      best = sig.callAt
+      bestValid = true
+  if not bestValid: return
+  for sig in all:
+    if sig.callAt == best: result.add sig
+
 proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
   var output = "matched\t" & $c.ideQuery.matched & "\n"
   if c.ideQuery.documentMode:
@@ -359,32 +394,7 @@ proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
   # the row. `candidate`, `visible` and `dotmember` are all name-keyed and a
   # signature is not a name, so it gets a row of its own rather than a shape they
   # would have to be told apart by.
-  # Only the call the cursor is inside. The bracket test upstream cannot distinguish
-  # a one-line call from a call whose arguments span fifty lines: a cursor anywhere
-  # between the first and last argument satisfies it, so a query inside such a call
-  # collected that call's overloads *and* every other multi-line call enclosing the
-  # same region. Observed on handlers.nim: five signatures, two of them duplicated,
-  # none of them belonging to the call under the cursor.
-  #
-  # The innermost enclosing call is the one whose own position is the last at or
-  # before the cursor. `callNodeInfo` is the callee's, so this picks the closest
-  # preceding call rather than the nearest argument.
-  var best = c.ideQuery.info
-  var bestValid = false
-  for sig in c.ideQuery.signatures:
-    if not sig.callAt.isValid: continue
-    if sig.callAt.line > best.line or
-       (sig.callAt.line == best.line and sig.callAt.col > best.col): continue
-    if not bestValid or sig.callAt.line > best.line or
-       (sig.callAt.line == best.line and sig.callAt.col >= best.col):
-      best = sig.callAt
-      bestValid = true
-  # Nothing at or before the cursor means the cursor is not inside a call, and the
-  # answer is no signature at all -- not the whole file's worth of them.
-  if not bestValid:
-    for sig in c.ideQuery.signatures: discard sig
-  for sig in c.ideQuery.signatures:
-    if not bestValid or sig.callAt != best: continue
+  for sig in signaturesAt(c.ideQuery.info, c.ideQuery.signatures):
     output.add "signature\t" & pool.symBasename(sig.sym) & "\t" & $sig.kind &
       "\t" & escapeTsv(sig.params) & "\n"
   # A dot's members, under their own tag. `visible` is the whole scope chain, and
@@ -987,6 +997,55 @@ proc semcheckCycleGroup(infiles, outfiles: seq[string]; config: sink NifConfig;
         writeOutput modules[i].c, modules[i].dest, modules[i].outfile
       else:
         quit 1
+
+proc semcheckInProcess*(infiles, outfiles: seq[string]; config: sink NifConfig;
+                        moduleFlags: set[ModuleFlag];
+                        commandLineArgs, hostCommandLineArgs: sink string;
+                        canSelfExec: bool): IdeQueryResult =
+  ## `semcheck`, additionally returning the editor query instead of only writing it
+  ## to the sidecar.
+  ##
+  ## A parallel entry point rather than a changed `semcheck` signature: `semcheck` is
+  ## on the batch path, and a caller is likely to want both shapes here. Nothing is
+  ## reimplemented -- `semcheckCore` does the work and writes the sidecar exactly as
+  ## before, which is what lets one call produce the struct *and* the text to compare
+  ## it against. The sidecar is still written because `writeIdeQuery` runs inside
+  ## `semcheckCore`, and that is deliberate for now: it makes the differential test a
+  ## comparison across one run's serialization rather than across two runs that
+  ## could differ for unrelated reasons.
+  ##
+  ## Single module only, because a cycle group has no single context to hand back --
+  ## that is the shape `semcheck` already refuses, and it is `semcheck`'s job to
+  ## refuse it, not this.
+  assert infiles.len == outfiles.len
+  assert infiles.len > 0
+  assert infiles.len == 1,
+         "semcheckInProcess takes one module; a cycle group has no single query"
+
+  let infile = infiles[0]
+  let outfile = outfiles[0]
+
+  var owningBuf = createTokenBuf(300)
+  var n0 = setupProgram(infile, outfile, owningBuf)
+  if SkipSystem in moduleFlags:
+    programs.publishStringType()
+  var c = initSemContext(prog.main.name, ProgramContext(config: config),
+                         moduleFlags, commandLineArgs, hostCommandLineArgs, canSelfExec)
+
+  var dest = createTokenBuf()
+  while true:
+    semcheckCore c, dest, n0
+    if not c.hasPendingPlugins: break
+    handleTypePlugins c, dest
+
+  result = IdeQueryResult(queried: c.ideQuery.enabled, matched: c.ideQuery.matched,
+                          documentMode: c.ideQuery.documentMode,
+                          visible: c.ideQuery.visible, candidates: c.ideQuery.candidates,
+                          imports: c.ideQuery.imports,
+                          dotMembers: c.ideQuery.dotMembers,
+                          signatures: signaturesAt(c.ideQuery.info,
+                                                     c.ideQuery.signatures),
+                          positions: c.ideQuery.positions)
 
 proc semcheck*(infiles, outfiles: seq[string]; config: sink NifConfig; moduleFlags: set[ModuleFlag];
                commandLineArgs, hostCommandLineArgs: sink string; canSelfExec: bool) =
