@@ -485,6 +485,16 @@ proc runCompiler*(db: Database; doc: Document): tuple[sidecar: string,
   elif result.sidecar.len == 0:
     result.failure = "compiler produced no result for this file"
 
+proc semanticErrorsFrom(errors: seq[IdeError]): seq[ParseDiagnostic] =
+  ## Diagnostics as sem reported them, from the struct rather than the sidecar.
+  ##
+  ## The file/line/column are already strings in `IdeError` -- they cannot be
+  ## anything else, since the pool they came from is gone once the run returns.
+  ## That is why this works, and why it could not have worked before.
+  result = @[]
+  for e in errors:
+    result.add ParseDiagnostic(line: e.line.int, col: e.col.int, message: e.msg)
+
 proc semanticErrors*(content: string): seq[ParseDiagnostic] =
   ## Undeclared identifiers and the other semantic errors, as the sidecar
   ## records them.
@@ -1048,10 +1058,6 @@ proc runSemInProcess*(db: Database; doc: Document;
     config.toTrack = TrackPosition(mode: TrackVisible, line: (line + 1).int32,
                                    col: (offset - lineStart + 1).int32,
                                    filename: doc.path)
-  # The sidecar is still written -- `writeIdeQuery` runs inside `semcheckCore` --
-  # and left in place deliberately for now. It is what `semanticErrors` reads,
-  # and the boundary test compares the struct against it. Removing it is the next
-  # step, and it needs errors to travel in the struct first.
   result = semcheckInProcess(@[doc.parsedFile],
                              @[db.cacheDir / (doc.moduleName & ".s.nif")],
                              config, {}, "", "", false)

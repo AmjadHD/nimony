@@ -126,6 +126,10 @@ type
     paths*, nimblePaths*: seq[string]
     baseDir*: string # base directory for the configuration system
     nifcachePath*: string
+    ## Whether an IDE query also writes the `.ide.tsv` sidecar. On by default,
+    ## because `nimony check --visible:` exists to produce that file; off for a
+    ## host that reads the query as a struct and would only pay for the I/O.
+    writeIdeSidecar*: bool
     bits*: int
     bitsExplicit*: bool  ## `--bits:N` (or an `intbits` config row) was given, so
                          ## `--cpu` must NOT overwrite it. Without this the two
@@ -217,6 +221,7 @@ proc initNifConfig*(baseDir: sink string): NifConfig =
   result = NifConfig(
     baseDir: baseDir,
     nifcachePath: "nimcache",
+    writeIdeSidecar: true,
     defines: @["nimony"],
     mm: DefaultMM,
     bits: sizeof(int)*8,

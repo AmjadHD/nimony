@@ -189,9 +189,33 @@ type
     visible*, candidates*, imports*, dotMembers*: seq[IdeSymbol]
     signatures*: seq[IdeSignature]
     positions*: seq[IdeResolution]
+    ## What sem reported, so a consumer that cannot read stdout still learns
+    ## where and what. The sidecar carried these as `error` rows; without them
+    ## here the editor has to keep reading that file, and then the whole point of
+    ## not writing it is lost.
+    ##
+    ## Plain values rather than `ErrorRecord`s because those hold a
+    ## `NifLineInfo`, whose `file` is a `FileId` into the pool -- interned for the
+    ## run, meaningless after it, the same hazard `IdeQuery.inferred` poses.
+    errors*: seq[IdeError]
+
+  IdeError* = object
+    ## One reported error, as the editor needs it.
+    file*: string
+    line*, col*: uint32
+    msg*: string
 
   IdeQuery* = object
     enabled*, matched*, documentMode*: bool
+    ## Whether `writeIdeQuery` should write the sidecar file at all.
+    ##
+    ## Off is for a host that reads `IdeQueryResult` and has no use for the text.
+    ## The sidecar is not small -- every identifier occurrence in a large file,
+    ## each with its resolution -- and writing it per query is most of the I/O an
+    ## in-process design was meant to remove. It stays on by default because
+    ## `nimony check --visible:` is a batch feature whose output IS that file, and
+    ## turning it off by default would silently change what the batch tool emits.
+    writeSidecar*: bool
     info*: NifLineInfo
     name*: StrId
     visible*, candidates*: seq[IdeSymbol]

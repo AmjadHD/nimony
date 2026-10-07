@@ -316,6 +316,20 @@ proc collectIdePositions*(c: var SemContext; dest: var TokenBuf) =
                    realFile(c.g.config.toTrack.filename))
   endRead(n)
 
+proc ideErrors(dest: var TokenBuf): seq[IdeError] =
+  ## What the reporters recorded, resolved to strings rather than pool ids.
+  ##
+  ## `dest` rather than a re-walk: the errors are already in it, and the only
+  ## thing that has to happen is turning a `FileId` into the path it names. That
+  ## conversion cannot be deferred to the consumer -- the pool is gone by then --
+  ## which is exactly why the sidecar had to carry the text.
+  result = @[]
+  for record in reporters.collectErrors(dest):
+    result.add IdeError(
+      file: (if record.info.isValid: pool.filenames[record.info.file] else: ""),
+      line: record.info.line.uint32, col: record.info.col.uint32,
+      msg: record.msg)
+
 proc signaturesAt(info: NifLineInfo; all: seq[IdeSignature]): seq[IdeSignature] =
   ## Only the call the cursor is inside. The bracket test upstream cannot distinguish
   ## a one-line call from a call whose arguments span fifty lines: a cursor anywhere
@@ -352,6 +366,11 @@ proc signaturesAt(info: NifLineInfo; all: seq[IdeSignature]): seq[IdeSignature] 
     if sig.callAt == best: result.add sig
 
 proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
+  # A host reading `IdeQueryResult` needs none of this, and the file is large:
+  # every identifier occurrence in the file, each with its resolution. Skipping
+  # the write is the difference between an in-process query that touches no
+  # filesystem beyond the parsed tree and one that writes megabytes per keystroke.
+  if not c.ideQuery.writeSidecar: return
   var output = "matched\t" & $c.ideQuery.matched & "\n"
   if c.ideQuery.documentMode:
     # One row per identifier occurrence, then one per import. The editor builds
@@ -490,6 +509,7 @@ proc enableIdeQuery(c: var SemContext; source: string) =
       info: NifLineInfo(file: pool.filenames.getOrIncl(track.filename),
                         line: track.line, col: track.col),
       name: StrId(0), visible: @[], candidates: @[],
+      writeSidecar: c.g.config.writeIdeSidecar,
       dotRequest: cursorCompletesMember(source, track.line, track.col))
 
 proc requestHookInstance(c: var SemContext; decl: Cursor) =
@@ -1046,7 +1066,8 @@ proc semcheckInProcess*(infiles, outfiles: seq[string]; config: sink NifConfig;
                           dotMembers: c.ideQuery.dotMembers,
                           signatures: signaturesAt(c.ideQuery.info,
                                                      c.ideQuery.signatures),
-                          positions: c.ideQuery.positions)
+                          positions: c.ideQuery.positions,
+                          errors: ideErrors(dest))
 
 proc semcheck*(infiles, outfiles: seq[string]; config: sink NifConfig; moduleFlags: set[ModuleFlag];
                commandLineArgs, hostCommandLineArgs: sink string; canSelfExec: bool) =
