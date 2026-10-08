@@ -17,7 +17,7 @@
 ##   nim c -r -o:bin/typing tests/lsp/typing.nim && ./bin/typing
 ## `hastur` will still run it, so it opts out of the joined group.
 
-import std / [assertions, os, strutils, syncio, uri, envvars, times, algorithm]
+import std / [assertions, os, strutils, syncio, uri, envvars, times, algorithm, osproc]
 import ../../src/lsp / [database, handlers]
 
 proc jsonEscape(s: string): string =
@@ -83,6 +83,8 @@ proc typeInto(db: var Database; uriText: string; base: string;
     if k == 0: result.first = ms else: result.rest += ms
   if keystrokes > 1: result.rest = result.rest div (keystrokes - 1)
 
+const dbCache* = "nimcache/lsp"
+
 proc run(label: string; flag: string; keystrokes, decls: int): int64 {.raises.} =
   putEnv("NIMONY_LSP_INPROCESS", flag)
   var db = initDatabase(getCurrentDir())
@@ -94,33 +96,57 @@ proc run(label: string; flag: string; keystrokes, decls: int): int64 {.raises.} 
     stdout.writeLine label & ": total " & $r.total & "ms, first " & $r.first &
                      "ms, then " & $r.rest & "ms/keystroke"
 
+proc runCold(label, flag: string; keystrokes, decls: int): tuple[first, rest: int64] {.raises.} =
+  ## Same as `run`, but returning the first keystroke separately instead of
+  ## discarding it, because on a cold cache it is a different order of magnitude.
+  putEnv("NIMONY_LSP_INPROCESS", flag)
+  var db = initDatabase(getCurrentDir())
+  let uriText = "file://" & getCurrentDir() / dbCache / "typing.nim"
+  let base = document(keystrokes, decls)
+  let t = typeInto(db, uriText, base, keystrokes)
+  result = (first: t.first, rest: t.rest)
+
+proc med(v: seq[int64]): int64 =
+  ## Not in place: `sort` takes a `var` here and the caller passes its own
+  ## sequence, which it still wants afterwards to print.
+  var c = v
+  c.sort()
+  c[c.len div 2]
+
+proc list(v: seq[int64]): string =
+  result = ""
+  for x in v: result.add $x & " "
+
 proc main() {.raises.} =
   const keystrokes = 8
-  # The first pass pays for the whole dependency closure and is reported on its
-  # own. Averaging a cold start into a per-keystroke number is how that number
-  # stops meaning anything -- and it is exactly the mistake the handler suite
-  # makes, since it opens each document once and so is all first checks.
-  # Sized to COMPLETE on a loaded machine. Three runs per size is what the noise
-  # floor allowed; the first keystroke is reported separately because a cold
-  # dependency closure can be an order of magnitude larger than the rest.
-  # Median of N. One figure was not enough: the spread between identical runs was
-  # larger than most of the effects being chased, which is how a "20% faster"
-  # claim survived three commits here.
-  var sub: seq[int64] = @[]
-  var inp: seq[int64] = @[]
+  # Two separate questions, and reporting one number for both would hide the
+  # answer to the second.
+  #
+  # WARM: the dependency closure already exists. This is what a session looks like
+  # after the first few seconds, and it is where the in-process path can win.
+  #
+  # COLD: the cache is wiped first. The subprocess path does not care -- nifmake
+  # builds whatever it needs -- but the in-process path GATES on the closure being
+  # present, because it cannot build one: `deps.nim` runs in `nifmake`, ahead of
+  # sem. So a cold server pays the subprocess price on its first check by design,
+  # and only the checks after it are cheaper. Averaging that away is exactly how
+  # this path would be sold on a number it does not deliver.
+  var subWarm: seq[int64] = @[]
+  var inpWarm: seq[int64] = @[]
   for i in 0 .. 4:
-    sub.add run("", "0", keystrokes, 60)
-    inp.add run("", "1", keystrokes, 60)
-  sub.sort(); inp.sort()
-  let med = proc (v: seq[int64]): int64 = v[v.len div 2]
-  var subTxt = ""
-  for v in sub: subTxt.add $v & " "
-  var inpTxt = ""
-  for v in inp: inpTxt.add $v & " "
-  stdout.writeLine "per-keystroke median of 5 -- subprocess " &
-    $med(sub) & "ms, in-process " & $med(inp) & "ms"
-  stdout.writeLine "  subprocess  " & subTxt
-  stdout.writeLine "  in-process  " & inpTxt
+    subWarm.add run("", "0", keystrokes, 60)
+    inpWarm.add run("", "1", keystrokes, 60)
+  stdout.writeLine "warm closure, per-keystroke median of 5"
+  stdout.writeLine "  subprocess  " & $(med(subWarm)) & "ms   [" & list(subWarm) & "]"
+  stdout.writeLine "  in-process  " & $(med(inpWarm)) & "ms   [" & list(inpWarm) & "]"
+
+  stdout.writeLine "cold cache: first keystroke, then the rest"
+  for flag in ["0", "1"]:
+    discard execCmdEx("rm -rf " & dbCache)
+    let r = runCold("", flag, keystrokes, 60)
+    stdout.writeLine "  " & (if flag == "0": "subprocess" else: "in-process") &
+      "  first " & $r.first & "ms, then " & $r.rest & "ms/keystroke"
+
   putEnv("NIMONY_LSP_INPROCESS", "0")
 
 proc entry() {.raises.} =
