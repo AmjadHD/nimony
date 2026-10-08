@@ -64,6 +64,14 @@ proc intField(node: JsonNode; name: string): int64 =
   elif kind(value) == JFloat: value.getFloat.int64
   else: 0
 
+proc boolField(node: JsonNode; name: string; fallback: bool): bool =
+  ## A missing or non-boolean field takes the caller's default rather than being
+  ## treated as false: `includeDeclaration` absent should include.
+  let value = node.field(name)
+  if value.isEmpty: return fallback
+  if kind(value) == JBool: value.getBool
+  else: fallback
+
 proc stringField(node: JsonNode; name: string): string =
   node.strField(name)
 
@@ -277,6 +285,21 @@ proc signatureHelpJson(query: SemanticSnapshot): string =
     result.add "]}"
   result.add "],\"activeSignature\":0,\"activeParameter\":0}"
 
+proc referencesJson(locations: seq[ReferenceLocation]): string =
+  ## LSP's `textDocument/references`: a flat `Location[]`.
+  ##
+  ## `[]` is a real answer and not a failure -- the cursor resolved to nothing, or
+  ## nothing else refers to it. Editors show that as "no results", which is the
+  ## truth.
+  result = "["
+  var first = true
+  for location in locations:
+    if not first: result.add ','
+    first = false
+    result.add "{\"uri\":" & quoteJson(location.uri) &
+      ",\"range\":" & rangeJson(location.range) & "}"
+  result.add ']'
+
 proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
   result = HandlerResult(response: "", notification: "", stop: false)
   var parsed = parseJson(body)
@@ -301,6 +324,7 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
       ",\"result\":{\"capabilities\":{\"textDocumentSync\":1," &
       "\"completionProvider\":{\"resolveProvider\":false}," &
       "\"hoverProvider\":true,\"definitionProvider\":true," &
+      "\"referencesProvider\":true," &
       "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}}," &
       "\"serverInfo\":{\"name\":\"nimony-lsp\",\"version\":\"0.1\"}}}"
   of "textDocument/didOpen", "textDocument/didChange":
@@ -326,32 +350,48 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
       "\"textDocument/publishDiagnostics\",\"params\":{\"uri\":" &
       quoteJson(uriText) & ",\"diagnostics\":[]}}"
   of "textDocument/completion", "textDocument/hover", "textDocument/definition",
-     "textDocument/signatureHelp":
+     "textDocument/signatureHelp", "textDocument/references":
     let uriText = field(params, "textDocument").strField("uri")
     let doc = db.document(uriText)
     var value = "null"
     if doc != nil:
       let pos = docPosition(params)
-      let nodeId = doc.nodeAt(pos.line, pos.character)
-      # The snapshot answers from recorded occurrences, which is a different
-      # index from the syntax nodes and covers the member name in `node.isEmpty`
-      # too -- there the syntax side has no node under the cursor, because the
-      # name is only reachable through the `dot`. Asking it first and tying the
-      # query to a node id threw away every semantic answer for exactly those
-      # positions, which is most call sites in practice.
+      # The syntax node under the cursor. Only the four requests that answer about
+      # THIS position need it, and asking for it first -- tying every query to a
+      # node id -- threw away every semantic answer for the member name in
+      # `node.isEmpty`, where the syntax side has no node under the cursor at all
+      # because the name is only reachable through the `dot`. That is most call
+      # sites in practice.
+      let nodeId = if methodName == "textDocument/references": -1
+                   else: doc.nodeAt(pos.line, pos.character)
       let memberRequest = methodName == "textDocument/completion" and
                        doc.memberCompletionAt(pos.line, pos.character)
-      # Signature help is the other request that must not be answered from the
-      # recorded occurrences: sem only records which overloads survive for a cursor
-      # query, and mid-call there is no identifier at the cursor to look up.
+      # Signature help is a request that must not be answered from the recorded
+      # occurrences: sem only records which overloads survive for a cursor query, and
+      # mid-call there is no identifier at the cursor to look up.
       let signatureRequest = methodName == "textDocument/signatureHelp"
-      let query = db.ideQueryAt(doc, pos.line, pos.character, memberRequest,
-                                signatureRequest)
       case methodName
-      of "textDocument/completion": value = completionJson(doc, pos.line, pos.character, query)
-      of "textDocument/hover": value = hoverJson(doc, nodeId, query)
-      of "textDocument/signatureHelp": value = signatureHelpJson(query)
-      else: value = definitionJson(doc, nodeId, query)
+      of "textDocument/references":
+        # References is a request that must not be answered from them either, and
+        # for the opposite reason: the OTHER occurrences are the answer, so it reads
+        # the whole snapshot rather than one position of it. Handing it to
+        # `ideQueryAt` would have answered a question nobody asked and thrown the
+        # answer away. A third kind of request rather than another flag on the two
+        # above, because what it skips is the lookup and not just the scope walk.
+        value = referencesJson(db.referencesAt(doc, pos.line, pos.character,
+          boolField(field(params, "context"), "includeDeclaration", true)))
+      of "textDocument/completion":
+        value = completionJson(doc, pos.line, pos.character,
+          db.ideQueryAt(doc, pos.line, pos.character, memberRequest, false))
+      of "textDocument/hover":
+        value = hoverJson(doc, nodeId,
+          db.ideQueryAt(doc, pos.line, pos.character, false, false))
+      of "textDocument/signatureHelp":
+        value = signatureHelpJson(db.ideQueryAt(doc, pos.line, pos.character, false,
+                                                signatureRequest))
+      else:
+        value = definitionJson(doc, nodeId,
+          db.ideQueryAt(doc, pos.line, pos.character, false, false))
     result.response = "{\"jsonrpc\":\"2.0\",\"id\":" & idText &
       ",\"result\":" & value & "}"
   of "shutdown":

@@ -3,7 +3,8 @@
 
 {.feature: "lenientnils".}
 
-import std / [tables, strutils, os, hashes, dirs, paths, syncio, osproc, envvars]
+import std / [algorithm, tables, strutils, os, hashes, dirs, paths, syncio, osproc,
+               envvars]
 import ../nifler2 / [nimgrammar, nimlexer, parserrt]
 import ../nifler2 / niflerout
 import ../lib / comesfrom
@@ -404,6 +405,199 @@ proc positionAt*(snapshot: SemanticSnapshot; line, character: int): IdePosition 
     bestDistance = distance
     result = position
   result
+
+type
+  ReferenceLocation* = object
+    uri*: string
+    range*: SourceRange
+
+  RefSpan = object
+    ## One identifier occurrence, with what it resolved to. Internal to the
+    ## reference query; only `ReferenceLocation` goes out.
+    line, column: int
+    keys: seq[string]
+    rank: int  ## of the record that won this span; see `recordRank`
+    isDeclaration: bool
+
+proc resolutionKey(s: SemanticSymbol): string =
+  ## What an occurrence resolved to, as one comparable string: the declaration's
+  ## URI, kind and name, and where in it the declaration sits.
+  ##
+  ## A symbol with no URI resolved to nothing -- sem records those with an empty
+  ## source file, which `symbolFromFields` turns into an empty URI and a zero
+  ## range. Two such rows compare equal to each other, so `o.a` and `o.b` would
+  ## match one another and find-references on a field name would return the whole
+  ## file. Empty is therefore "no identity", and an occurrence with no keys is
+  ## never a reference to anything.
+  result = ""
+  if s.uri.len == 0: return
+  result = s.uri & "\t" & s.kind & "\t" & s.name & "\t" & $s.range.startLine & "\t" &
+    $s.range.startCharacter
+
+proc sameKeys(a, b: seq[string]): bool {.inline.} =
+  ## Whether two occurrences resolved to exactly the same thing.
+  ##
+  ## Equal and not merely intersecting. `foo(1)` and `foo("s")` are one occurrence
+  ## each with different answers, and the intersection rule would call them two
+  ## references to one `foo` -- which is the one answer a reference query must not
+  ## give. Two occurrences that weighed the same overload *set* are references,
+  ## because they are equally undecided, and this admits that while keeping the
+  ## two cases apart.
+  if a.len == 0 or a.len != b.len: return false
+  for i in 0 ..< a.len:
+    if a[i] != b[i]: return false
+  true
+
+proc dedupeKeys(keys: var seq[string]) =
+  keys.sort()
+  var kept = 0
+  for key in keys:
+    if kept > 0 and keys[kept - 1] == key: continue
+    keys[kept] = key
+    inc kept
+  keys.setLen(kept)
+
+proc recordRank(symbols: seq[SemanticSymbol]): int =
+  ## How much a recorded occurrence says about what it resolved to: 2 for a single
+  ## resolved symbol, 1 for an overload set, 0 for nothing.
+  ##
+  ## The same ranking `positionAt` applies to pick one record out of several at the
+  ## cursor, and for the same reason. Reusing the shape rather than the answer is
+  ## the point: a span's answer is "what does this occurrence resolve to", and
+  ## whether sem recorded a resolution or only the set it weighed is the same
+  ## question at every span.
+  if symbols.len == 1: 2 elif symbols.len > 1: 1 else: 0
+
+proc spansOf(snapshot: SemanticSnapshot; name: string): seq[RefSpan] =
+  ## Every span in this snapshot where `name` occurs, with what it resolved to.
+  ##
+  ## One span can carry more than one record. sem reports a call that went through
+  ## overload resolution twice: once as the SET it weighed, and once as the single
+  ## overload it picked. On `overload(1)` in a two-overload fixture that is a span
+  ## holding {int, string} and a span holding {int}.
+  ##
+  ## Unioning those was the first thing tried here and it is wrong in a way no test
+  ## of one overload would have caught: the union is {int, string} at BOTH call
+  ## sites, so `overload(1)` and `overload("s")` became indistinguishable and each
+  ## reported the other as a reference. The better-ranked record wins instead, which
+  ## is what makes the two apart -- and is why the ranking is a named proc shared
+  ## with `positionAt` rather than a comparison written a second time.
+  ##
+  ## One pass with a span index rather than a scan per candidate span, which is what
+  ## "collect the other records at this span" would otherwise cost: quadratic in the
+  ## occurrences of the one name being asked about.
+  result = @[]
+  var index = initTable[string, int]()
+  for p in snapshot.positions:
+    if p.name != name: continue
+    let key = $p.line & ":" & $p.column
+    var at = -1
+    try:
+      if index.hasKey(key): at = index[key]
+    except:
+      at = -1
+    if at < 0:
+      at = result.len
+      result.add RefSpan(line: p.line, column: p.column, keys: @[], rank: -1,
+                         isDeclaration: false)
+      index[key] = at
+    let rank = recordRank(p.symbols)
+    if rank < result[at].rank: continue
+    result[at].rank = rank
+    result[at].keys = @[]
+    result[at].isDeclaration = false
+    for s in p.symbols:
+      let k = resolutionKey(s)
+      if k.len == 0: continue
+      result[at].keys.add k
+      # This span IS the declaration, rather than a use of it. A line comparison
+      # alone would also swallow `proc f() = f()`, where the call is on the
+      # declaration's line; the name's own span on that line excludes it, because
+      # sem records a declaration's column as the start of the line rather than of
+      # the name, and `sourceRange` recovers the name's real column from there.
+      if p.line - 1 == s.range.startLine and
+          p.column >= s.range.startCharacter and
+          p.column < s.range.startCharacter + name.len:
+        result[at].isDeclaration = true
+  for at in 0 ..< result.len:
+    dedupeKeys(result[at].keys)
+  result.sort(proc (a, b: RefSpan): int =
+    if a.line != b.line: a.line - b.line else: a.column - b.column)
+
+proc occurrenceRange(doc: Document; line, column: int;
+                     name: string): SourceRange {.raises.} =
+  ## The span of one occurrence, as LSP wants it.
+  ##
+  ## A recorded column is a byte offset into the line -- `correctPositionColumns`
+  ## snaps it by searching the line's text -- while a range on the wire is in
+  ## UTF-16 units. Both ends go through the same helper `sourceRange` uses, so the
+  ## two cannot end up disagreeing about what unit a column is in. A line the
+  ## document no longer has (an edit landed between the check and the request) is
+  ## passed through unchanged rather than guessed at.
+  let lineNo = max(0, line - 1)
+  let lines = doc.lineText
+  let text = if lineNo < lines.len: lines[lineNo] else: ""
+  let at = utf16ColumnTo(text, min(max(0, column), text.len))
+  let after = utf16ColumnTo(text, min(max(0, column + name.len), text.len))
+  SourceRange(startLine: lineNo, startCharacter: at, endLine: lineNo,
+              endCharacter: max(at + 1, after))
+
+proc referencesAt*(db: Database; doc: Document; line, character: int;
+                   includeDeclaration = true): seq[ReferenceLocation] {.raises.} =
+  ## Every occurrence of the symbol under the cursor.
+  ##
+  ## Answered from the document-mode check, which already recorded every occurrence
+  ## in the file, so this compiles nothing -- the same reason hover and completion
+  ## are free at a position. A document sem has never run on answers nothing rather
+  ## than falling back to a per-position compile, for the reason `ideQueryAt`
+  ## gives: zero recorded positions means there is no identifier here at all.
+  ##
+  ## Every OPEN document is searched, not just this one, which is what makes a
+  ## cross-file reference work. Files the editor has not opened are not searched:
+  ## that needs a check of the whole project, which is the thing this design is
+  ## built to avoid paying per keystroke.
+  result = @[]
+  if doc.snapshot.positions.len == 0: return
+  let at = doc.snapshot.positionAt(line, character)
+  if at.line < 0 or at.name.len == 0: return
+  # The cursor's own span, taken out of the same collection the search walks, so
+  # the target and the candidates are built by one rule and cannot disagree about
+  # what a span resolved to.
+  let spans = doc.snapshot.spansOf(at.name)
+  var target = RefSpan(line: -1, column: -1, keys: @[], rank: -1,
+                       isDeclaration: false)
+  for span in spans:
+    if span.line == at.line and span.column == at.column:
+      target = span
+      break
+  # Nothing resolved here, so there is no identity to match against. That is the
+  # answer for a member name: sem records `o.a` with an empty source file, and
+  # reporting "no references" for it is honest where guessing would not be.
+  if target.keys.len == 0: return
+  addReferences(result, doc, spans, at.name, target, includeDeclaration)
+  var others: seq[Document] = @[]
+  for _, other in pairs(db.documents):
+    if other == doc or other.snapshot.positions.len == 0: continue
+    others.add other
+  others.sort(proc (a, b: Document): int = cmp(a.uri, b.uri))
+  for other in others:
+    addReferences(result, other, other.snapshot.spansOf(at.name), at.name, target,
+                  includeDeclaration)
+
+proc addReferences(found: var seq[ReferenceLocation]; doc: Document;
+                   spans: seq[RefSpan]; name: string; target: RefSpan;
+                   includeDeclaration: bool) {.raises.} =
+  ## The spans of `name` in one document that resolved to what the cursor is on.
+  ##
+  ## `spans` is passed in rather than collected here so the cursor's document -- by
+  ## far the common case -- is scanned once instead of twice, and so the same spans
+  ## are compared that the target was chosen from.
+  for span in spans:
+    if not sameKeys(span.keys, target.keys): continue
+    if not includeDeclaration and span.isDeclaration: continue
+    found.add ReferenceLocation(uri: doc.uri,
+                                range: doc.occurrenceRange(span.line, span.column,
+                                                           name))
 
 proc unescapeTsv(s: string): string =
   result = newStringOfCap(s.len)
