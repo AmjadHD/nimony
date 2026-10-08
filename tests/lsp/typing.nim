@@ -65,12 +65,23 @@ proc request(methodName, uriText, text: string; id = -1): string =
   result.add "}}"
 
 proc typeInto(db: var Database; uriText: string; base: string;
-              keystrokes: int): tuple[total: int64, first: int64,
+              keystrokes: int): tuple[open: int64, total: int64, first: int64,
                                      rest: int64] {.raises.} =
-  result = (total: 0'i64, first: 0'i64, rest: 0'i64)
-  ## One `didOpen` then `keystrokes` `didChange`s, timed individually so the
-  ## first is reported on its own.
+  result = (open: 0'i64, total: 0'i64, first: 0'i64, rest: 0'i64)
+  ## A `didOpen`, then `keystrokes` `didChange`s.
+  ##
+  ## The `didOpen` is timed separately because it is where a cold cache is PAID.
+  ## It is the check that walks the import graph and builds every dependency
+  ## interface, so on a wiped cache it is an order of magnitude more expensive than
+  ## the keystrokes -- and it uses the subprocess either way, because the
+  ## in-process path gates on the closure that this very check produces.
+  ##
+  ## Leaving it out is what made an earlier version of this report in-process
+  ## paying 170ms on a cold cache: the cost had already been incurred one request
+  ## earlier, by the request nothing was counting.
+  let tOpen = getTime()
   discard handle(db, request("textDocument/didOpen", uriText, base))
+  result.open = inNanoseconds(getTime() - tOpen) div 1000000
   for k in 0 ..< keystrokes:
     let t0 = getTime()
     let body = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":" &
@@ -96,7 +107,8 @@ proc run(label: string; flag: string; keystrokes, decls: int): int64 {.raises.} 
     stdout.writeLine label & ": total " & $r.total & "ms, first " & $r.first &
                      "ms, then " & $r.rest & "ms/keystroke"
 
-proc runCold(label, flag: string; keystrokes, decls: int): tuple[first, rest: int64] {.raises.} =
+proc runCold(label, flag: string; keystrokes, decls: int): tuple[open, first,
+                                                               rest: int64] {.raises.} =
   ## Same as `run`, but returning the first keystroke separately instead of
   ## discarding it, because on a cold cache it is a different order of magnitude.
   putEnv("NIMONY_LSP_INPROCESS", flag)
@@ -104,7 +116,7 @@ proc runCold(label, flag: string; keystrokes, decls: int): tuple[first, rest: in
   let uriText = "file://" & getCurrentDir() / dbCache / "typing.nim"
   let base = document(keystrokes, decls)
   let t = typeInto(db, uriText, base, keystrokes)
-  result = (first: t.first, rest: t.rest)
+  result = (open: t.open, first: t.first, rest: t.rest)
 
 proc med(v: seq[int64]): int64 =
   ## Not in place: `sort` takes a `var` here and the caller passes its own
@@ -140,12 +152,12 @@ proc main() {.raises.} =
   stdout.writeLine "  subprocess  " & $(med(subWarm)) & "ms   [" & list(subWarm) & "]"
   stdout.writeLine "  in-process  " & $(med(inpWarm)) & "ms   [" & list(inpWarm) & "]"
 
-  stdout.writeLine "cold cache: first keystroke, then the rest"
+  stdout.writeLine "cold cache: the didOpen that builds the closure, then keystrokes"
   for flag in ["0", "1"]:
     discard execCmdEx("rm -rf " & dbCache)
     let r = runCold("", flag, keystrokes, 60)
     stdout.writeLine "  " & (if flag == "0": "subprocess" else: "in-process") &
-      "  first " & $r.first & "ms, then " & $r.rest & "ms/keystroke"
+      "  didOpen " & $r.open & "ms, then " & $r.rest & "ms/keystroke"
 
   putEnv("NIMONY_LSP_INPROCESS", "0")
 
