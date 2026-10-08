@@ -175,17 +175,25 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   assert opened.notification.contains("undeclared identifier") or
          opened.notification.contains("UnknownType")
 
-  let cacheFile = db.document(uri).cacheFile
-  assert cacheFile.contains("nimcache/lsp")
+  # The document's derived artifacts live under the LSP's own cache dir, not the
+  # source tree. `parsedFile` rather than the serialized-tree copy that used to
+  # sit beside it: nothing ever read that one, so it was a second full copy of
+  # every open buffer, rebuilt and written on every keystroke for no consumer.
+  assert db.document(uri).parsedFile.contains("nimcache/lsp")
   let changed = handle(db, """{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim","version":2},"contentChanges":[{"text":"let replacement = 7\n"}]}}""")
   note(responses, "changed", changed.response)
   assert changed.notification.contains("publishDiagnostics")
   assert db.document(uri).version == 2
   assert db.document(uri).nodes.len > 0
 
+  # Taken before the close, since afterwards there is no document to ask.
+  let parsedFile = db.document(uri).parsedFile
   discard handle(db, """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"}}}""")
   assert db.document(uri) == nil
-  assert not fileExists(cacheFile)
+  # Closing a document takes its cache artifacts with it. The serialized-tree copy
+  # that used to be checked here is gone; the parsed file is what sem consumes and
+  # what is actually written, so it is the one worth asserting on.
+  assert not fileExists(parsedFile)
 
   # A `./`-less sibling import has to keep working. The root is handed to sem as
   # a pre-parsed `.nif` under the cache dir, so the root's directory is the cache

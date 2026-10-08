@@ -63,11 +63,9 @@ type
     diagnostics*: seq[ParseDiagnostic]       ## from the recovering parser
     semanticDiagnostics*: seq[ParseDiagnostic] ## from the compiler's sem pass
     snapshot*: SemanticSnapshot  ## every identifier occurrence, from one check
-    nifTree*: string
     docComments*: Table[int, string]
       ## `##` documentation keyed by the line the block ends on, as the parser
       ## recorded it -- not re-scanned from the text
-    cacheFile*: string
     parsedFile*: string
     moduleName*: string
     queryCached*: bool
@@ -80,6 +78,19 @@ type
     ## call. Derived once per document version rather than kept as a second shape,
     ## so the two keys cannot drift apart.
     openDocs*: Table[int, string]
+    ## The OPEN document's own `FileIndex`, built once per version.
+    ##
+    ## Without this, `sourceRange` built it per symbol: `buildFileIndex` splits
+    ## the text into lines AND runs the whole lexer over it looking for comments,
+    ## and a document-mode query calls `sourceRange` once per recorded candidate.
+    ## Measured at 129,258 calls, 0.32 ms each, 41 seconds of a single keystroke --
+    ## almost all of it re-lexing the same buffer over and over.
+    ##
+    ## `docCommentAt` never showed this because it answers from `openDocs` and
+    ## returns before reaching an index at all, which is why the cost looked like
+    ## it belonged to the wrong function. A `ref` so handing it out is not a copy
+    ## of the document's text.
+    openIndex*: ref FileIndex
     ## Indexes of every OTHER file this document's queries have touched. Held on
     ## the document and dropped with it, so an edit to any file cannot leave a
     ## stale index behind: the invalidation is "a newer version exists", not a
@@ -328,19 +339,17 @@ proc updateDocument*(db: var Database; uri, path: string; version: int;
   p.keepComments = true
   parseModule p
   doc.docComments = p.docComments
+  doc.openIndex = buildFileIndex(text)
   doc.openDocs = initTable[int, string]()
   for key, text in p.docComments:
     if text.len > 0:
       doc.openDocs[docBlockFirstLine(text, key)] = text
   # A new version, so a fresh set of other-file indexes: any file that changed
   # under an open buffer has changed without anything telling us.
-  doc.otherFiles = OtherFiles(byPath: initTable[string, FileIndex]())
+  doc.otherFiles = OtherFiles(byPath: initTable[string, ref FileIndex]())
   doc.diagnostics = p.errors
-  let tree = finish(p)
-  doc.nifTree = toString(tree)
+  discard finish(p)
   doc.indexSyntax()
-  let key = $hash(uri)
-  doc.cacheFile = db.cacheDir / (key & ".nif")
   doc.moduleName = moduleSuffix(path, db.modulePaths)
   doc.parsedFile = db.cacheDir / (doc.moduleName & ".p.nif")
   writeNifler(p.first, p.pool, p.tags, cellCount(p.arena) * 8,
@@ -348,22 +357,16 @@ proc updateDocument*(db: var Database; uri, path: string; version: int;
   writeDeps(p.first, p.pool, p.tags,
             db.cacheDir / (doc.moduleName & ".p.deps.nif"))
   p.close()
-  try:
-    writeFile(doc.cacheFile, doc.nifTree)
-  except:
-    discard
   db.documents[uri] = doc
   result = doc
 
 proc closeDocument*(db: var Database; uri: string) {.raises.} =
   if db.documents.hasKey(uri):
-    let cacheFile = db.documents.getOrDefault(uri).cacheFile
     let parsedFile = db.documents.getOrDefault(uri).parsedFile
     let depsFile = db.cacheDir / (db.documents.getOrDefault(uri).moduleName & ".p.deps.nif")
     let ideFile = db.cacheDir / (db.documents.getOrDefault(uri).moduleName & ".ide.tsv")
     let semFile = db.cacheDir / (db.documents.getOrDefault(uri).moduleName & ".s.nif")
     try:
-      if os.fileExists(cacheFile): removeFile(path(cacheFile))
       if os.fileExists(parsedFile): removeFile(path(parsedFile))
       if os.fileExists(depsFile): removeFile(path(depsFile))
       if os.fileExists(ideFile): removeFile(path(ideFile))
@@ -600,12 +603,21 @@ type
     ## update -- `updateDocument` builds a fresh one and hands back a value -- so
     ## a by-value table would be discarded on each keystroke and the cache would
     ## never survive to its second lookup.
-    byPath*: Table[string, FileIndex]
+    byPath*: Table[string, ref FileIndex]
 
-proc buildFileIndex(text: string): FileIndex =
+proc buildFileIndex(text: string): ref FileIndex =
   ## `text` split, offset-indexed and lexed for its `##` blocks, in one pass each.
-  result = FileIndex(text: text, docs: initTable[int, string](),
-                     lineStarts: @[], lines: @[])
+  ##
+  ## A `ref`, so every reader of an index gets a pointer rather than a copy of a
+  ## whole file's text, lines and offsets. Field by field rather than
+  ## `result[] = FileIndex(...)`: assigning a whole record through the
+  ## dereference does not lower here -- the C backend copies the struct into the
+  ## ref itself and rejects it.
+  new(result)
+  result[].text = text
+  result[].docs = initTable[int, string]()
+  result[].lines = @[]
+  result[].lineStarts = @[]
   var offset = 0
   for line in text.splitLines():
     result.lineStarts.add offset
@@ -630,7 +642,7 @@ proc buildFileIndex(text: string): FileIndex =
     next lex, tok
 
 
-proc fileIndex(doc: Document; path: string): FileIndex =
+proc fileIndex(doc: Document; path: string): ref FileIndex =
   ## The index for `path`, read and lexed once per document version.
   ##
   ## Memoized on the document, so the second query about the same file is a table
@@ -642,7 +654,7 @@ proc fileIndex(doc: Document; path: string): FileIndex =
   ## empty index rather than retried, so a broken path costs one attempt per
   ## document version instead of one per symbol.
   if doc.otherFiles == nil:
-    doc.otherFiles = OtherFiles(byPath: initTable[string, FileIndex]())
+    doc.otherFiles = OtherFiles(byPath: initTable[string, ref FileIndex]())
   # `hasKey` then `[]`, inside a `try`: this stdlib marks the indexing operator as
   # `.raises`, and a hit has to hand the stored record back by value. Reading it
   # through `getOrDefault` instead would work, but then an EMPTY index -- an
@@ -749,7 +761,9 @@ proc utf16ColumnTo(text: string; byteColumn: int): int =
 proc sourceRange(doc: Document; source: string; line, col: int;
                  name: string): SourceRange {.raises.} =
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
-  let index = if path == doc.path: buildFileIndex(doc.text)
+  # The open document's index is already built for this version; only another
+  # file's has to be looked up.
+  let index = if path == doc.path and doc.openIndex != nil: doc.openIndex
               else: doc.fileIndex(path)
   let text = index.text
   var byteColumn = col

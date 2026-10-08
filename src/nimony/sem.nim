@@ -1446,6 +1446,17 @@ proc captureDotMembers(c: var SemContext, dest: TokenBuf; lhs: Item;
   # Appended one at a time: `add` on a seq here takes a single element, so handing it
   # the whole seq does not concatenate.
   for sym in qualifiedEnumMembers(root): members.add sym
+  # Replaced, not appended to. `semDot` calls this for EVERY dot, so a line like
+  # `o.inner.` reached here twice and the two batches stacked: completing on the
+  # second dot offered `Outer`'s fields AND `Inner`'s. That is worse than being
+  # wrong, because `o.alpha` is a plausible-looking suggestion on a receiver that
+  # does not have it.
+  #
+  # Replacing gives "the closest dot at or before the cursor wins" for free. Dots
+  # are visited in source order and a dot past the cursor has already returned
+  # above, so the last batch to get here is exactly the nearest qualifying one.
+  # The same shape as `signaturesAt`, which narrows overloads to one call.
+  c.ideQuery.dotMembers.setLen(0)
   for sym in members:
     var ide = c.ideSymbol(dest, sym)
     ide.kind = EfldY
