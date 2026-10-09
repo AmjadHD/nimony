@@ -132,6 +132,15 @@ proc runBothModes(label, text: string) {.raises.} =
   let docSnap = parseIdeSnapshot(doc, readFile(sidecar), -1, -1)
   assert docRun.matched == docSnap.matched,
          label & ": matched " & $docRun.matched & " vs " & $docSnap.matched
+  # The transports have to agree on the MODE, not just on what the mode found.
+  # `completionJson` branches on `documentMode`, so a reader that reported `false`
+  # for a document mode run did not lose an answer -- it answered a different
+  # question. And it could not be caught by any of the length and element compares
+  # below: they all say "the same occurrences arrived", which was true while the
+  # flag beside them said the opposite.
+  assert docRun.documentMode == docSnap.documentMode,
+         label & ": document mode " & $docRun.documentMode & " in the struct, " &
+         $docSnap.documentMode & " from the sidecar"
 
   assert docRun.positions.len == docSnap.positions.len,
          label & ": " & $docRun.positions.len & " occurrences in the struct, " &
@@ -191,6 +200,12 @@ proc runBothModes(label, text: string) {.raises.} =
   assert cursorRun.matched == cursorSnap.matched,
          label & ": cursor matched " & $cursorRun.matched & " vs " &
          $cursorSnap.matched
+  # And the other direction, which is the one a reader that defaulted the field
+  # would pass: `false` is the initial value, so a flag nobody writes reads as
+  # cursor mode forever. Only a cursor-mode fixture can tell the two apart.
+  assert cursorRun.documentMode == cursorSnap.documentMode,
+         label & ": cursor document mode " & $cursorRun.documentMode &
+         " in the struct, " & $cursorSnap.documentMode & " from the sidecar"
   # `visible` is the scope chain and the reader filters it to local symbols, so
   # the struct's list is the superset: every symbol the sidecar kept must be in
   # the struct with the same name.

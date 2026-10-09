@@ -1082,6 +1082,23 @@ proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
     inc i
     if fields.len == 2 and fields[0] == "matched":
       result.matched = fields[1] == "true"
+    elif fields.len == 2 and fields[0] == "documentmode":
+      # Read, not inferred. This is the one field on which the two transports used
+      # to give opposite answers: sem hands the struct the real value, and the
+      # sidecar used to say nothing about it, so the text reader left it at `false`
+      # for a run that was plainly document mode -- the very run this editor does on
+      # every edit. `completionJson` branches on it, so the disagreement decided
+      # which of the two completion paths ran.
+      #
+      # Inferring it from the rows would not do, and not only for the empty case.
+      # `position` rows and `import` rows are both absent from a document mode run
+      # over a file with no identifier occurrences, and `error` rows are absent
+      # whenever the file has no errors -- so each candidate predicate is also a
+      # statement about the file's contents. That is a different question wearing
+      # this one's clothes, and the reader below already asks the contents question
+      # where it wants it: `ideQueryAt` decides on `positions.len`, deliberately,
+      # because there the honest reading is "nothing to look up".
+      result.documentMode = fields[1] == "true"
     elif fields.len >= 5 and fields[0] == "position":
       # Document mode. The header carries the count of the `candidate` rows
       # that FOLLOW it, so they are consumed here rather than matched by tag:

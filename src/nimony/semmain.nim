@@ -371,7 +371,13 @@ proc writeIdeQuery(c: SemContext; dest: var TokenBuf) =
   # the write is the difference between an in-process query that touches no
   # filesystem beyond the parsed tree and one that writes megabytes per keystroke.
   if not c.ideQuery.writeSidecar: return
-  var output = "matched\t" & $c.ideQuery.matched & "\n"
+  # The two scalars first, and both on every run, whatever mode produced the rest.
+  # A reader that cannot see them has to infer, and inference from the rows below
+  # is wrong in exactly the cases that matter: a document mode run over a file
+  # with no identifier occurrences writes no `position` row and no `import` row,
+  # so "did it happen" and "did it find anything" become the same question.
+  var output = "matched\t" & $c.ideQuery.matched & "\n" &
+    "documentmode\t" & $c.ideQuery.documentMode & "\n"
   if c.ideQuery.documentMode:
     # One row per identifier occurrence, then one per import. The editor builds
     # a position index from this and answers any cursor position without

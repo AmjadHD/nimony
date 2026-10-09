@@ -26,6 +26,14 @@ source line, so instead of matching one cursor it records, in a single sem pass:
 - the module's import table (`import` rows), which does not depend on a cursor,
 - the semantic errors (`error` rows).
 
+Two scalars come first, on every run in either mode: `matched` and `documentmode`.
+They are written rather than inferred from the rows above, because every row that
+could stand in for `documentmode` is absent from a document mode run over a file
+that has no identifier occurrences, no imports, or no errors — so "did it happen"
+and "did it find anything" would be the same question. The editor reads the flag:
+completion answers from the import table in document mode and from the scope chain
+at a cursor, so a reader that got it wrong answered a different question.
+
 The editor indexes the occurrences by position, so hover and go-to-definition
 are table lookups.
 
