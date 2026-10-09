@@ -120,9 +120,13 @@ proc checkTornTopLevel() =
   let buf = finish(p)
   let tree = toString(buf)
   p.close()
-  # A node, not text. `(proc later` cannot appear inside an err node's raw string
-  # because that string is one string literal and carries no parentheses.
-  assert tree.contains("(proc later"),
+  # A node, not text -- and by the BODY rather than by the proc's own name. The
+  # declaration's line info sits between the tag and the name, so the head reads
+  # `(proc@,4,file later@5`, and `(proc later` is a spelling this dumper never emits.
+  # That assertion passed for a while and meant nothing. The body cannot: raw text
+  # carries `discard 2` and no parentheses or line info, so `(discard 2@8)` is only
+  # reachable if the declaration was parsed into nodes.
+  assert tree.contains("(discard 2@8)"),
          "the later declaration is not a node, so sem will never see it: " & tree
   assert parenBalance(tree) == 0,
          "tree is " & $parenBalance(tree) & " out of balance: " & tree

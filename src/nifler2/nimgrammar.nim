@@ -26,6 +26,7 @@
 
 import std / strutils
 import parserrt
+import ".." / lib / nifpools
 from ".." / lib / nifcore import createTokenBuf
 export parserrt
 
@@ -1068,7 +1069,32 @@ proc parseModule*(p: var Parser) =
     # thing, so stop rather than loop to the guard.
     if p.tok.line * 4096 + int(p.tok.col) == at and p.errors.len == seenErrors: break
     seenErrors = p.errors.len
+    # Another pass, and then UNWRAP what it produced.
+    #
+    # `module` wraps the statements it parses in a fresh `(stmts ...)`, and `wrapAt`
+    # splices that node into the module's own statement chain. So a second pass
+    # leaves a bare `(stmts ...)` sitting where a statement belongs -- and nothing
+    # else in the grammar produces that shape: `(discard 1)` comes out as
+    # `(expr (stmts) (discard 1))`, so a nested statement list is always inside an
+    # `expr`. It looked harmless, because the tree was balanced and the declarations
+    # were in it, but `sem` walks statements through `semExpr` and has no `StmtsX`
+    # case -- so the whole second pass was parsed, written to the `.nif`, and never
+    # analysed. The declarations after a syntax error were invisible for that reason,
+    # not because recovery had swallowed them.
+    #
+    # Hand the wrapper's children to the chain the wrapper took the place in, and
+    # drop the wrapper. `p.last` needs no fixing: the last child is the same node
+    # either way, only one level up.
+    let mark = Mark(prev: p.last, info: NoLineInfo, sigs: p.sigs)
     pModule p
+    # `mark.prev` is the sibling the wrapper took the place of, and `mark.prev.next`
+    # is the wrapper. Done inline rather than through `since`/`setSince`, which are
+    # private to `parserrt`: this is the same two assignments they make, and the
+    # module always has a statement before the recovery loop runs.
+    let wrapper = if mark.prev == nil: p.first else: mark.prev.next
+    if wrapper != nil and kind(wrapper) == TagLit and
+        tag(wrapper) == globalTags.registerTag("stmts") and wrapper.down != nil:
+      if mark.prev == nil: p.first = wrapper.down else: mark.prev.next = wrapper.down
 
 proc parseSnippet*(code: string; asExpr: bool; pool: Pool; tags: TagPool;
                    err: var string): TokenBuf =
