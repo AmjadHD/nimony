@@ -99,16 +99,48 @@ proc diagnosticJson(d: ParseDiagnostic; severity: int; source: string): string =
 proc diagnosticsJson(doc: Document): string =
   ## Parser and sem diagnostics together. Both refer to positions in this
   ## document's text, so the editor underlines both in one pass.
+  ##
+  ## But not every semantic diagnostic is a NEW one. The recovering parser leaves
+  ## each error in the tree as an `(err <line>,<col> "<message>")` node -- that is
+  ## how the declarations after a syntax error survive into sem's input at all --
+  ## and sem copies such a node through with `takeTree` without descending into it.
+  ## `collectErrors` then walks the output and finds it again, so every parse error
+  ## arrives twice: once from `doc.diagnostics` and once from
+  ## `doc.semanticDiagnostics`, with the same position and the same text. Measured
+  ## on a torn top-level line, the editor published
+  ##
+  ##   parse: L3:4 identifier expected, but got '='
+  ##   sem:   L3:4 identifier expected, but got '='
+  ##
+  ## Two squiggles on one error, and the editor's problem-count badge doubles for
+  ## every keystroke that is mid-syntax.
+  ##
+  ## Dropped here, where the diagnostics are assembled for the editor, rather than in
+  ## sem: the error node has to STAY in the tree, since it is what carries the
+  ## recovered source onwards, and sem's output is read by other tools that have no
+  ## parser diagnostics to deduplicate against.
+  ##
+  ## One rule over the whole published set rather than over the join of the two
+  ## lists, because there is a second source: the parser reports an injury twice at
+  ## the same place when both the layout pass and `parseModule`'s tail see it, which
+  ## is the same squiggle twice and would survive a join-only filter.
+  ##
+  ## Keyed on position and text together. The position alone would merge two genuinely
+  ## different complaints about one line -- and there are such pairs, as when a torn
+  ## line yields both "expression of type `int64` must be discarded" and "undeclared
+  ## identifier: value" at the same spot. The text alone would merge the same message
+  ## on two lines, which is a real report each time.
+  var seen = initHashSet[string]()
   result = "["
   var first = true
-  for d in doc.diagnostics:
-    if not first: result.add ','
-    first = false
-    result.add diagnosticJson(d, 1, "nimony")
-  for d in doc.semanticDiagnostics:
-    if not first: result.add ','
-    first = false
-    result.add diagnosticJson(d, 1, "nimony")
+  for list in [doc.diagnostics, doc.semanticDiagnostics]:
+    for d in list:
+      let key = $d.line & ":" & $d.col & ":" & d.message
+      if key in seen: continue
+      seen.incl key
+      if not first: result.add ','
+      first = false
+      result.add diagnosticJson(d, 1, "nimony")
   result.add ']'
 
 proc uriPath(uriText: string): string {.raises.} =

@@ -18,7 +18,7 @@
 ##
 ## `.nojoin`: it shells out to the compiler per case.
 
-import std / [assertions, os, osproc, strutils, syncio]
+import std / [assertions, os, osproc, sets, strutils, syncio]
 import ../../src/lsp/[database, handlers]
 
 const fixtureDir = "tests" / "lsp" / "fixtures" / ".." / "parser_recovery"
@@ -45,6 +45,32 @@ proc checkRecovered(label, text: string) {.raises.} =
   stdout.writeLine label & ": " & $count & " diagnostics, sem finished"
   assert count < 60,
          label & ": " & $count & " diagnostics from a few lines is a flood, not a parse"
+  # And no error reported TWICE.
+  #
+  # The recovering parser leaves each error in the tree as an `(err ...)` node --
+  # that is what carries the source after a tear onwards to sem -- and sem copies it
+  # through without descending, so `collectErrors` finds the same error again in
+  # sem's output. The editor published both, on the same position, with the same text:
+  # two squiggles, and a problem count that doubles for every keystroke mid-syntax.
+  #
+  # Asserted as a COUNT against the deduplicated set, not by scanning the
+  # notification for repeats. The scanning version mis-paired a position with a
+  # message and reported a duplicate the diagnostic lists do not contain -- so it was
+  # replaced by the property itself, which needs no JSON: what the editor receives
+  # must be exactly the diagnostics, deduplicated.
+  # Fetched back rather than kept from the handler: `handle` returns only what it
+  # published, and the property is about which diagnostics exist, not about how they
+  # were spelled on the wire.
+  let doc = db.document(uri)
+  assert doc != nil, label & ": the document was not registered: " & opened.notification
+  var unique = initHashSet[string]()
+  for d in doc.diagnostics:
+    unique.incl $d.line & ":" & $d.col & ":" & d.message
+  for d in doc.semanticDiagnostics:
+    unique.incl $d.line & ":" & $d.col & ":" & d.message
+  assert count == unique.len,
+         label & ": published " & $count & " diagnostics for " & $unique.len &
+         " distinct ones: " & opened.notification
 
 proc runTests() {.raises.} =
   # Each fixture alone, which is what the corpus covers, and then all of them
