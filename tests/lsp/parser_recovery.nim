@@ -133,6 +133,43 @@ proc checkTornTopLevel() =
   # And the skipped text is no longer carrying the rest of the file.
   assert not tree.contains("proc later() =\n  discard 2"),
          "the rest of the file is still raw text inside the error node: " & tree
+  # INSIDE the module's statement list, not merely somewhere in the file.
+  #
+  # Both checks above passed while `later` sat at ROOT level -- a balanced
+  # `(err ...)` sibling of the module's `(stmts ...)`, which `sem` never walks:
+  # `semcheckCore` asserts `n0.stmtKind == StmtsS` and then `n.into` bounds the walk
+  # to that node's body. Measured by the lines sem resolved names on, a declaration
+  # after a syntax error went from invisible to analysed, and the only difference is
+  # which list it is in. Presence in the file is not presence in the statement list,
+  # and only the second one is compiled.
+  #
+  # "Inside" stated as the paren that closes the module's list coming AFTER the
+  # declaration. A depth count needed a first version that was wrong in a way only
+  # the tree dump exposed, and this says the same thing with no arithmetic.
+  let head = tree.find("(stmts@")
+  let decl = tree.find("(discard 2@8)")
+  assert head >= 0 and decl > head, "module list or later declaration missing: " & tree
+  var depth = 0
+  var closedAt = -1
+  var i = head
+  var inStr = false
+  while i < tree.len and closedAt < 0:
+    let ch = tree[i]
+    if inStr:
+      if ch == '\\': inc i
+      elif ch == '"': inStr = false
+    else:
+      case ch
+      of '"': inStr = true
+      of '(': inc depth
+      of ')':
+        dec depth
+        if depth == 0: closedAt = i
+      else: discard
+    inc i
+  assert closedAt > decl,
+         "the later declaration is outside the module's statement list, which closes at " &
+         $closedAt & " while it is at " & $decl & ": " & tree
 
 proc checkLegalDots() =
   ## A dot's field name may be a keyword -- `a.and`, `a.type`, `a.import` are all

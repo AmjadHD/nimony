@@ -1095,6 +1095,39 @@ proc parseModule*(p: var Parser) =
     if wrapper != nil and kind(wrapper) == TagLit and
         tag(wrapper) == globalTags.registerTag("stmts") and wrapper.down != nil:
       if mark.prev == nil: p.first = wrapper.down else: mark.prev.next = wrapper.down
+    # And then MOVE what this pass produced INTO the module's own statement list.
+    #
+    # `module` closes its `(stmts ...)` when it returns, so everything the loop
+    # appends afterwards -- the second error node, and the declarations the resync
+    # recovered -- lands at ROOT level, beside the module's statements rather than
+    # inside them:
+    #
+    #   (stmts@,1,f (proc zzA ...) (err@4,2 (stmts)"...")"))(err@4,3,f (proc@,4,f zzLater ...))
+    #
+    # The file is balanced, which is why this looked fine. But `sem` bounds its walk
+    # to that node -- `semcheckCore` asserts `n0.stmtKind == StmtsS` and then
+    # `n.into` -- so it read two statements and stopped. Traced with the statements
+    # the walk actually visited:
+    #
+    #   [phaseX] stmt NoExpr at L1:0
+    #   [phaseX] stmt err    at L3:4
+    #
+    # Two of four, and the two it missed are exactly the ones after the error. So the
+    # declarations were in the `.nif`, balanced and unanalysed: the editor showed
+    # nothing after a syntax error because `sem` was never shown them, not because
+    # recovery had swallowed them.
+    let run = if mark.prev == nil: p.first else: mark.prev.next
+    if run != nil and p.first != nil and p.first != mark.prev:
+      var tail = p.first.down
+      if tail == nil:
+        p.first.down = run
+      else:
+        while tail.next != nil: tail = tail.next
+        tail.next = run
+      # The root holds only the module's own node again, so that node is the last
+      # one. Getting this wrong would leave the next `wrapAt` closing the wrong
+      # parent.
+      if mark.prev == nil: p.last = p.first else: mark.prev.next = nil
 
 proc parseSnippet*(code: string; asExpr: bool; pool: Pool; tags: TagPool;
                    err: var string): TokenBuf =
