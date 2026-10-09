@@ -107,6 +107,8 @@ type
     docComments*: Table[int, string] ## `##` text keyed by its last line
     errors*: seq[ParseDiagnostic] ## recovered parser diagnostics
     syncStack: seq[tuple[first, follow: SyncPredicate]]
+    syncBase: tuple[first, follow: SyncPredicate]
+    syncBaseSet: bool
     errLine*, errCol*: int ## where, `errCol` 0-based
     errMsg*: string        ## what
 
@@ -131,6 +133,7 @@ proc openParser*(src, filename: string; pool: Pool; tags: TagPool): Parser =
                   inPragma: 0, sections: @[], lastSection: VarL, wrapFields: @[],
                   pool: pool, tags: tags,
                   failed: false, recovering: false, errors: @[], syncStack: @[],
+                  syncBaseSet: false,
                   errLine: 0, errCol: 0, errMsg: "")
   next result.lex, result.tok
 
@@ -694,15 +697,47 @@ proc closeNode(p: var Parser; m: Mark; tag: NiflerKind; info: NifLineInfo) {.inl
   wrapAt p, m, tag, info
 
 proc pushRecovery*(p: var Parser; first, follow: SyncPredicate) {.inline.} =
-  if p.recovering: p.syncStack.add (first, follow)
+  if p.recovering:
+    # The first frame is the module rule's, and its FIRST/FOLLOW is the top-level
+    # statement set. Kept because the stack empties between rules, which is exactly
+    # where `parseModule`'s tail diagnoses -- see `isRecoveryPoint`.
+    if not p.syncBaseSet:
+      p.syncBase = (first, follow)
+      p.syncBaseSet = true
+    p.syncStack.add (first, follow)
 
 proc popRecovery*(p: var Parser) {.inline.} =
   if p.recovering and p.syncStack.len > 0: p.syncStack.setLen(p.syncStack.len - 1)
 
 proc isRecoveryPoint(p: Parser): bool {.inline.} =
-  if p.syncStack.len == 0: return p.tok.kind == tkEof
-  let sync = p.syncStack[^1]
-  sync.first(p) or sync.follow(p)
+  ## Whether the current token is somewhere a rule could carry on from.
+  ##
+  ## Outermost frame first. Every generated rule pushes its own FIRST/FOLLOW pair, so
+  ## the module rule's frame is at the bottom with a FIRST covering every top-level
+  ## starter. An injury inside a call's argument list leaves sixteen frames up, the
+  ## innermost belonging to the argument list with a FOLLOW of `)` -- a following
+  ## `discard` matches none of them, the skip loop runs to end of file, and the rest
+  ## of the input becomes the error node's `(stmts @raw)` payload: inert text that sem
+  ## copies with `takeTree` and never walks.
+  ##
+  ## Outermost first because the widest resync point is the safe one: a token every
+  ## enclosing rule already agreed to accept.
+  for i in 0 ..< p.syncStack.len:
+    if p.syncStack[i].first(p) or p.syncStack[i].follow(p): return true
+  if p.syncStack.len > 0: return false
+  # An EMPTY stack is not "nothing can follow". It means every rule has popped, the
+  # normal state between two top-level items, and exactly where `parseModule`'s tail
+  # diagnoses the token `module` gave up on. Reading it as end-of-file-only is what
+  # turned one unfinished line into the loss of the file: traced on `let = ` + a
+  # following `proc`, the skip went
+  #
+  #   stack=0 tok== at=-1 -> skipped 6 toks, now at L6 tok=[EOF]
+  #
+  # leaving `(stmts "= \nproc zzLater() =\n  discard 2\n")` as the error's payload and
+  # the module's own `(stmts` unclosed.
+  if p.syncBaseSet:
+    return p.syncBase.first(p) or p.syncBase.follow(p)
+  p.tok.kind == tkEof
 
 proc sourceOffset(src: string; line, col: int): int =
   result = 0

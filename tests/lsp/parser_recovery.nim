@@ -59,7 +59,17 @@ proc checkRecovery(src, laterName: string; rawSpan = "") =
   p.close()
   assert tree.contains("(err"), "no err node in: " & tree
   assert tree.contains(laterName), "later declaration lost: " & tree
-  if rawSpan.len > 0: assert tree.contains(rawSpan), "bad span was lost: " & tree
+  # The err node's raw span must still COVER the skipped tokens, not equal them.
+  #
+  # It used to be an equality, and that equality was a measurement of the old
+  # behaviour rather than of a requirement: recovery ran to end of file, so for
+  # `let = 1` the span was the whole of `= 1`. It now stops at `1`, which `module`
+  # can start a statement with, so the span is `= `. Demanding the old span would
+  # have pinned the bug. A prefix keeps the real requirement -- nothing skipped is
+  # dropped -- while letting recovery stop as early as it can.
+  if rawSpan.len > 0:
+    assert tree.contains("\"" & rawSpan),
+           "the skipped span is no longer in the err node: " & tree
 
   # Every opened construct closes, even through an error node. This is the
   # property Phase 2v1 rests on: it walks the tree, so a single missing ParRi
@@ -82,8 +92,43 @@ proc runFixtures() {.raises.} =
   checkRecovery(readFile(fixtures / "unclosed_paren.nim.txt"), "afterParen")
   checkRecovery(readFile(fixtures / "dangling_dot.nim.txt"), "afterDot")
   checkRecovery(readFile(fixtures / "dangling_dot_before_proc.nim.txt"), "other")
-  checkRecovery(readFile(fixtures / "incomplete_let.nim.txt"), "afterLet", "= 1")
+  checkRecovery(readFile(fixtures / "incomplete_let.nim.txt"), "afterLet", "= ")
   checkRecovery(readFile(fixtures / "truncated_expression.nim.txt"), "value")
+
+proc checkTornTopLevel() =
+  ## An unfinished statement at TOP LEVEL, followed by a whole declaration.
+  ##
+  ## Every other fixture here tears inside a proc body or an argument list. This one
+  ## tears where `module` itself gives up, and that path had nothing testing it.
+  ##
+  ## `module` returns at the first token it cannot use, and `parseModule`'s tail then
+  ## names it -- from OUTSIDE every rule, with an empty sync stack, where the only
+  ## recovery point available was end of file. So one unfinished line consumed the
+  ## rest of the file into the error node's `(stmts @raw)`: a string literal, which
+  ## sem copies with `takeTree` and never walks.
+  ##
+  ## `checkRecovery`'s assertions are `tree.contains(laterName)` and balance. The
+  ## first passes either way, because an err node carries the skipped source
+  ## verbatim -- that is what let this shape go unnoticed. So the assertions here are
+  ## STRUCTURAL: the later declaration must be a `(proc ...)` node, and the tree must
+  ## balance. The tree did not balance: the module's own `(stmts` was never closed.
+  let src = "proc first() =\n  discard 1\nlet = \nproc later() =\n  discard 2\n"
+  var p = openParser(src, "parser_recovery.nim", pool, globalTags)
+  p.recovering = true
+  parseModule p
+  assert p.errors.len > 0, "missing recovered diagnostic"
+  let buf = finish(p)
+  let tree = toString(buf)
+  p.close()
+  # A node, not text. `(proc later` cannot appear inside an err node's raw string
+  # because that string is one string literal and carries no parentheses.
+  assert tree.contains("(proc later"),
+         "the later declaration is not a node, so sem will never see it: " & tree
+  assert parenBalance(tree) == 0,
+         "tree is " & $parenBalance(tree) & " out of balance: " & tree
+  # And the skipped text is no longer carrying the rest of the file.
+  assert not tree.contains("proc later() =\n  discard 2"),
+         "the rest of the file is still raw text inside the error node: " & tree
 
 proc checkLegalDots() =
   ## A dot's field name may be a keyword -- `a.and`, `a.type`, `a.import` are all
@@ -133,6 +178,7 @@ proc checkCheckers() =
 
 try:
   runFixtures()
+  checkTornTopLevel()
   checkLegalDots()
   checkCheckers()
 except:

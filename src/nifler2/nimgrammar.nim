@@ -1034,15 +1034,41 @@ proc parseModule*(p: var Parser) =
   if p.tok.indent > 0:
     indentError p     # `parseTopLevelStmt`: the first statement starts a line
   pModule p
-  if not p.failed and p.tok.kind != tkEof:
-    # `module` stops at a token that does not start a statement, or not its
-    # own line: parser.nim's `parseTopLevelStmt`
-    if p.tok.indent == 0 or (p.tok.indent < 0 and p.prevKind in {tkInvalid, tkSemiColon}):
+  # Keep going while `module` stops on a token that could still start a top-level item.
+  #
+  # `module` returns at the first token it cannot use and this tail names that token.
+  # Under recovery the naming is not the end of the story: `errorAt` resyncs, and the
+  # token it lands on is one `module` WOULD have accepted -- so there has to be
+  # another pass. Without one the resync is inert, because no loop is left to re-enter,
+  # and the rest of the file survives only as the error node's `(stmts @raw)` payload:
+  # inert text that sem copies with `takeTree` and never walks. Traced on `let = `
+  # followed by a `proc`, before this loop:
+  #
+  #   (err@4,2 (stmts .)"identifier expected...")
+  #   (err@4,3 (stmts "= \nproc zzLater() =\n  discard 2\n")"invalid indentation")
+  #
+  # `zzLater` in a string, not in a `(proc zzLater ...)` node, and the module's own
+  # `(stmts` left unclosed.
+  var guard = 0
+  var seenErrors = p.errors.len
+  while p.recovering and not p.failed and p.tok.kind != tkEof and guard < 64:
+    inc guard
+    let at = p.tok.line * 4096 + int(p.tok.col)
+    # `module` stops at a token that does not start a statement, or not its own line:
+    # parser.nim's `parseTopLevelStmt`
+    if p.tok.indent == 0 or
+        (p.tok.indent < 0 and p.prevKind in {tkInvalid, tkSemiColon}):
       exprExpected p
     elif p.tok.kind == tkOpr and p.tok.s == "*":
       error p, "invalid indentation; an export marker '*' follows the declared identifier"
     else:
       indentError p
+    if p.tok.kind == tkEof: break
+    # No cursor movement and no new diagnostic means another pass would say the same
+    # thing, so stop rather than loop to the guard.
+    if p.tok.line * 4096 + int(p.tok.col) == at and p.errors.len == seenErrors: break
+    seenErrors = p.errors.len
+    pModule p
 
 proc parseSnippet*(code: string; asExpr: bool; pool: Pool; tags: TagPool;
                    err: var string): TokenBuf =
