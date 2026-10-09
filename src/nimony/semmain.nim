@@ -17,7 +17,7 @@ when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
 import std / [tables, sets, syncio, assertions, hashes]
-from std/os import changeFileExt, getCurrentDir, isAbsolute, absolutePath, normalizedPath
+from std/os import changeFileExt, getCurrentDir, isAbsolute, absolutePath, normalizedPath, `/`
 include ".." / lib / nifprelude
 include ".." / lib / compat2
 import ".." / lib / [symparser, nifindexes, docpaths]
@@ -733,6 +733,55 @@ proc lowerAndProve(c: var SemContext; dest: var TokenBuf) =
       quit 1
   dest = stripAnalysisFacts(ensureMove fir)
 
+when defined(dumpPhases):
+  proc dumpPhase(c: var SemContext; buf: var TokenBuf; stage: string) =
+    ## One phase's buffer, as text, in the module's own cache directory.
+    ##
+    ## `-d:dumpPhases` is the only way to see what each phase produced, and it did
+    ## not COMPILE: five `toString(r, false)` calls are `.raises`, and none of them
+    ## was wrapped. A define that cannot be built is a define nobody has ever had on,
+    ## which is how a broken debugging aid goes unnoticed -- and it is the instrument
+    ## that would have localised "sem does not analyse what comes after an error"
+    ## in one run instead of a tree dump and an inference.
+    ##
+    ## Both raising calls are contained HERE rather than at the five call sites,
+    ## because a dump that cannot be written must not abort a compile that would
+    ## otherwise succeed: this is a debugging aid, and it is the wrong moment to
+    ## discover the disk is full. `endRead` runs before the write for the same
+    ## reason -- a raised `toString` must not strand the read cursor.
+    ##
+    ## Four of the five stages dump. PHASE 3 DOES NOT, and cannot from here:
+    ## `phase3` leaves the module's `(stmts` open, so `beginRead`'s balance assert
+    ## fires -- and it cannot be caught, because this compiler's `assert` quits the
+    ## process rather than raising, so a `try` around the read is not a guard. The
+    ## obvious remedies do not work either: `openTags` is private to `nifcore`, so
+    ## there is no way to ask from here whether a buffer is closed, and dumping
+    ## earlier is worse rather than earlier. A phase-3 dump needs either an exported
+    ## predicate or `phase3` closing its own statement list -- a change to sem's
+    ## contract, not to a debugging aid. Until then the phase-3 slot is absent rather
+    ## than present and fatal, because a define that kills the compiler on the first
+    ## build is not a debugging aid.
+    ##
+    ## The directory is the configured cache, not a literal `nimcache`: that is where
+    ## the phase artefacts already live, it is created for us, and a relative
+    ## directory is wrong whenever the compiler's working directory is not the
+    ## project root -- which is exactly what the language server does.
+    let name = "dump." & c.thisModuleSuffix & "." & stage & ".nif"
+    try:
+      var r = beginRead(buf)
+      let text = toString(r, false)
+      endRead(r)
+      writeFile(c.g.config.nifcachePath / name, text)
+    except:
+      # Name the stage in a file, not on stderr: the language server runs sem through
+      # `execCmdEx`, which swallows the subprocess's stderr, so a bare "beginRead with
+      # unclosed tags" arrives with nowhere to point. Missing dumps are then silent
+      # about WHICH one failed, which is the only thing the reader needs to know.
+      try:
+        writeFile(c.g.config.nifcachePath / (name & ".FAILED"), stage)
+      except:
+        discard
+
 proc runPhases(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   ## The three sem phases. Each phase's buffer is consumed by the next one and
   ## released when this returns, before generics, derefs and the contract pass
@@ -741,18 +790,12 @@ proc runPhases(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   var (buf1, moduleLineInfo) = phase1(c, dest, n0)
   dbgCheckSeals(buf1, "phase1")
   when defined(dumpPhases):
-    block:
-      var r = beginRead(buf1)
-      syncio.writeFile("nimcache/dump." & c.thisModuleSuffix & ".phase1.nif", toString(r, false))
-      endRead(r)
+    dumpPhase(c, buf1, "phase1")
   #echo "PHASE 2"
   var buf2 = phase2(c, buf1, moduleLineInfo)
   dbgCheckSeals(buf2, "phase2")
   when defined(dumpPhases):
-    block:
-      var r = beginRead(buf2)
-      syncio.writeFile("nimcache/dump." & c.thisModuleSuffix & ".phase2.nif", toString(r, false))
-      endRead(r)
+    dumpPhase(c, buf2, "phase2")
   #echo "PHASE 3"
   dest = phase3(c, buf2, moduleLineInfo)
 
@@ -760,18 +803,12 @@ proc derefsOf(c: var SemContext; afterSem: sink TokenBuf): TokenBuf =
   ## `injectDerefs` over the checked module. `afterSem` is released on return:
   ## nothing after derefs reads it.
   when defined(dumpPhases):
-    block:
-      var r = beginRead(afterSem)
-      syncio.writeFile("nimcache/dump." & c.thisModuleSuffix & ".beforederefs.nif", toString(r, false))
-      endRead(r)
+    dumpPhase(c, afterSem, "beforederefs")
   var finalBuf = beginRead afterSem
   result = injectDerefs(finalBuf, c.typeHooks, c.classes, c.thisModuleSuffix, c.g.config.bits,
                         cycles = c.g.config.cycles)
   when defined(dumpPhases):
-    block:
-      var r = beginRead(result)
-      syncio.writeFile("nimcache/dump." & c.thisModuleSuffix & ".afterderefs.nif", toString(r, false))
-      endRead(r)
+    dumpPhase(c, result, "afterderefs")
 
 proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   c.currentScope = Scope(tab: initTable[StrId, seq[Sym]](), kind: ToplevelScope)
@@ -792,11 +829,30 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   # tree and return the query snapshot instead of making an editor parse fatal.
   if c.ideQuery.enabled:
     dest.addParRi()
+    # Phase 3 dumped on the editor path too, and for the same reason the other site
+    # cannot simply be moved: `phase3` leaves the module's `(stmts` OPEN, so there is
+    # nothing to read until the `addParRi` above. Moving the existing dump up to the
+    # end of `runPhases` gets that far and then fails with "beginRead with unclosed
+    # tags" -- which is the compiler being right and the obvious fix being wrong.
+    #
+    # Without this the define missed the only case it was wanted for: under
+    # `--visible:` the early return meant no phase-3 dump of the open file at all, so
+    # "what did phase 3 do to this document" could not be asked of the document being
+    # edited.
     c.collectIdePositions(dest)
     c.captureIdeImports(dest)
     writeIdeQuery c, dest
     let outfile = c.g.config.nifcachePath & "/" & c.thisModuleSuffix & ".s.nif"
     writeOutput c, dest, outfile
+    # NO phase-3 dump here, and the reason is worth keeping. `beginRead` asserts on a
+    # TokenBuf with unclosed tags, and the buffer sem leaves on this path IS
+    # unbalanced: `writeOutput` writes it directly and never needs it closed. So a
+    # dump cannot be taken of the open document's phase 3, and the failure cannot be
+    # contained either -- this compiler's `assert` quits the process rather than
+    # raising, so `try`/`except` around `dumpPhase` does not catch it. It was tried in
+    # three positions and took the compiler down with `beginRead with unclosed tags`
+    # each time. `phase3` leaving the module's `(stmts` open is the underlying thing,
+    # and closing it is phase3's contract to change, not a debugging aid's.
     return
 
   if c.expanded.len > 0:
@@ -816,11 +872,6 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
   instantiateGenericHooks c, dest
   dest.addParRi()
   dbgCheckSeals(dest, "phase3")
-  when defined(dumpPhases):
-    block:
-      var r = beginRead(dest)
-      syncio.writeFile("nimcache/dump." & c.thisModuleSuffix & ".phase3.nif", toString(r, false))
-      endRead(r)
 
   if reportErrors(dest) == 0:
     var afterSem = move dest
