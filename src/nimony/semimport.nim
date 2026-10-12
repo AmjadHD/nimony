@@ -132,7 +132,7 @@ proc importSingleFile*(c: var SemContext; dest: var TokenBuf; f1: ImportedFilena
   var exports: seq[(string, ImportFilter)] = @[] # ignored
   discard importSingleFile(c, dest, f1, origin, filter, exports, info)
 
-proc importSingleFileConsiderExports(c: var SemContext; dest: var TokenBuf; f1: ImportedFilename; origin: string; filter: ImportFilter; info: NifLineInfo) =
+proc importSingleFileConsiderExports(c: var SemContext; dest: var TokenBuf; f1: ImportedFilename; origin: string; filter: ImportFilter; info: NifLineInfo): SymId =
   var exports: seq[(string, ImportFilter)] = @[]
   let source = importSingleFile(c, dest, f1, origin, filter, exports, info)
   while exports.len != 0:
@@ -146,6 +146,7 @@ proc importSingleFileConsiderExports(c: var SemContext; dest: var TokenBuf; f1: 
       else:
         modEntry[].exports[forward] = ex[1]
     exports = newExports
+  source
 
 proc cyclicImport(c: var SemContext; dest: var TokenBuf; x: var Cursor) =
   ## Handle `import foo {.cyclic.}`. Registers the module sym and records
@@ -204,10 +205,44 @@ proc cyclicImport(c: var SemContext; dest: var TokenBuf; x: var Cursor) =
       # Non-cyclic import in same statement; skip it (should not happen in practice)
       skip x
 
+proc recordImportedModuleName(c: var SemContext; f: ImportedFilename;
+                              origin: string; modSym: SymId) =
+  ## The module name in an `import` is the one identifier in the statement that
+  ## `doImports` DESTROYS: the phase-3 tree carries `(kv <suffix> "<file>")`
+  ## instead, so `walkIdePositions` -- which reads the finished tree, and is how
+  ## every other occurrence in the file is found -- has no node left to record.
+  ## That is why hovering or jumping to `os` in `import std/os` answered `null`
+  ## and `[]` while `getAppFilename` in the same file answered perfectly: the
+  ## module name was never a recorded occurrence.
+  ##
+  ## Recorded here instead, while the name still exists, because this is the only
+  ## place that has both halves: `f.info` for where the name was written and the
+  ## `ModuleY` symbol for what it means. The gate is the same one
+  ## `collectIdePositions` uses, and it is enough on its own -- imported modules
+  ## are semmed by `selfExec` in a separate process, so an enabled `ideQuery`
+  ## means this IS the module the editor asked about.
+  ##
+  ## The candidate points at the module's FILE, line 0. A module has no
+  ## declaration line, and this is what every language server answers for a
+  ## module: the import statement's own line info would make go-to-definition
+  ## jump to the position the user is already standing on.
+  if not c.ideQuery.enabled or not c.ideQuery.documentMode: return
+  if modSym == SymId(0) or not f.info.isValid: return
+  if f.info.file != c.ideQuery.info.file: return
+  let resolved = resolveFile(c.g.config.paths, origin, f.path)
+  if not fileExists(resolved): return
+  c.ideQuery.positions.add IdeResolution(
+    name: pool.symNameId(modSym),
+    info: f.info,
+    candidates: @[IdeSymbol(id: modSym, kind: ModuleY,
+                            info: NifLineInfo(file: pool.filenames.getOrIncl(resolved),
+                                              line: 0, col: 0))])
+
 proc doImports(c: var SemContext; dest: var TokenBuf; files: seq[ImportedFilename]; mode: ImportFilter; info: NifLineInfo) =
   let origin = getFile(info)
   for f in files:
-    importSingleFileConsiderExports c, dest, f, origin, mode, info
+    let modSym = importSingleFileConsiderExports(c, dest, f, origin, mode, info)
+    recordImportedModuleName(c, f, origin, modSym)
   if files.len > 0:
     onConceptImportsChanged(c)
 

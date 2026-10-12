@@ -103,14 +103,29 @@ of 2280 (95.7%). The cold build matters: an earlier measurement of 87.9% was
 taken with the cache already warm, which silently pre-seeded the very dependency
 the cold path needs and made a broken configuration look like a coverage gap.
 
-Most of what does not answer is the module path in an `import` list and a pragma
-name -- neither is an identifier in the checked tree, and together they account
-for every miss in `server.nim`. What is left is a real gap: a `proc`'s declared
-return type is not recorded (`proc quoteJson(s: string): string` answers for
-`s` but not for the result type), and the magic `result` is not. Every other
-real occurrence -- a parameter in a signature, a field chosen through a dot, a
-name imported from another module, a local shadowed in an inner scope -- is
-recorded.
+Most of what does not answer is a pragma name -- not an identifier in the checked
+tree. What is left is a real gap: a `proc`'s declared return type is not recorded
+(`proc quoteJson(s: string): string` answers for `s` but not for the result type),
+and the magic `result` is not. Every other real occurrence -- a parameter in a
+signature, a field chosen through a dot, a name imported from another module, a
+local shadowed in an inner scope, the module named in an `import` -- is recorded.
+
+A module named in an import is the one that needed the compiler to help, because
+`doImports` destroys it: the phase-3 tree carries `(kv <suffix> "<file>")` where
+the source said `os`, so `walkIdePositions` -- the walk that finds every other
+occurrence in the file by reading the finished tree -- has no node left to record
+and the editor has nothing to answer from. Hover said `null` and go-to-definition
+`[]` while an imported symbol in the same file answered perfectly, which is what
+made it read as a resolution failure rather than a missing record. The name and
+its position are now captured in `filenameVal` and recorded by `doImports`, the
+only place holding both halves. The candidate points at the module's file at line
+0, because a module has no declaration line, and pointing at the import would make
+go-to-definition jump to where the user is already standing.
+
+With `import std/os as m`, `m` is recorded and `os` is not: after an alias the
+path component is not a name the module binds, so answering it would name a symbol
+nothing can refer to. An unresolvable module records nothing and stays an ordinary
+diagnostic. `include` is still unanswered -- it never reaches `doImports`.
 
 Two details make that work. The walk reads the finished phase-3 tree rather
 than a resolution callback, so it sees occurrences wherever the tree puts them.

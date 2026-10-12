@@ -207,6 +207,11 @@ type
     name*: string ## extracted module name to define a sym for in `import`
     plugin*: string ## plugin name if any (usually empty)
     isSystem*: bool
+    info*: NifLineInfo ## where the module NAME was written, for the editor.
+                      ## `doImports` replaces the name with `(kv <suffix> <file>)`,
+                      ## so by the time the phase-3 tree is walked the occurrence
+                      ## and everything hover and go-to-definition would need to
+                      ## find it are both gone.
 
 proc moduleNameFromPath*(path: string): string =
   result = splitFile(path).name
@@ -217,15 +222,15 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
     let s = pool.strings[n.strId]
     # string literal could contain a path or .nim extension:
     let name = moduleNameFromPath(s)
-    res.add ImportedFilename(path: s, name: name)
+    res.add ImportedFilename(path: s, name: name, info: n.info)
     inc n
   of Ident:
     let s = pool.strings[n.strId]
-    res.add ImportedFilename(path: s, name: s)
+    res.add ImportedFilename(path: s, name: s, info: n.info)
     inc n
   of Symbol:
     var s = pool.symBasename(n.symId)
-    res.add ImportedFilename(path: s, name: s)
+    res.add ImportedFilename(path: s, name: s, info: n.info)
     inc n
   of TagLit:
     case exprKind(n)
@@ -236,8 +241,9 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
         else:
           filenameVal(n, res, hasError, allowAs)
     of QuotedX:
+      let info = n.info
       let s = pool.strings[takeUnquoted(n)]
-      res.add ImportedFilename(path: s, name: s)
+      res.add ImportedFilename(path: s, name: s, info: info)
     of CallX, InfixX:
       var x = n
       skip n # ensure we skipped it completely
@@ -259,6 +265,9 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
         if not rhs.hasMore:
           hasError = true
           return
+        # The alias is the name the module is bound to, so it is the occurrence an
+        # editor should answer on -- `m` in `import std/math as m`, not `std/math`.
+        let aliasInfo = rhs.info
         let aliasId = takeIdent(rhs)
         if aliasId == StrId(0):
           hasError = true
@@ -269,7 +278,7 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
         if rhs.hasMore or prefix.len == 0:
           hasError = true
         for pre in mitems(prefix):
-          res.add ImportedFilename(path: pre.path, name: alias)
+          res.add ImportedFilename(path: pre.path, name: alias, info: aliasInfo)
       else: # any operator, could restrict to slash-like
         var prefix: seq[ImportedFilename] = @[]
         filenameVal(x, prefix, hasError, allowAs = false)
@@ -279,7 +288,10 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
           hasError = true
         for pre in mitems(prefix):
           for suf in mitems(suffix):
-            res.add ImportedFilename(path: pre.path & op & suf.path, name: suf.name, plugin: suf.plugin)
+            # `suf`, not `pre`: in `std/os` the module is `os`, and `os` is where
+            # the name an editor should answer on is written.
+            res.add ImportedFilename(path: pre.path & op & suf.path, name: suf.name,
+                                     plugin: suf.plugin, info: suf.info)
     of PrefixX:
       var x = n
       skip n # ensure we skipped it completely
@@ -294,7 +306,8 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
       if x.hasMore or suffix.len == 0:
         hasError = true
       for suf in mitems(suffix):
-        res.add ImportedFilename(path: op & suf.path, name: suf.name, plugin: suf.plugin)
+        res.add ImportedFilename(path: op & suf.path, name: suf.name, plugin: suf.plugin,
+                                 info: suf.info)
     of ParX, TupX, BracketX:
       n.into:
         if not n.hasMore:
