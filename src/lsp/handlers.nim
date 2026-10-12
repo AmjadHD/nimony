@@ -190,6 +190,31 @@ proc definitionJson(doc: Document; nodeId: int; query: SemanticSnapshot): string
         ",\"range\":" & rangeJson(n.range) & "}"
   result.add ']'
 
+proc displayKind(raw: string): string =
+  ## A NIF symbol-kind tag name -> what a reader should be told.
+  ##
+  ## The sidecar carries `NimonySym`'s own tag names, and that taxonomy is right
+  ## for codegen and wrong in a popup: `glet`/`gvar` carry a SCOPE prefix (global),
+  ## `tlet`/`tvar` a storage class (thread-local), and `efld`/`fld`/`gfld` name an
+  ## enum field, an object field and a constructor-guarded field. A hover read
+  ## "``glet TopLet``" and "`efld colRed`" -- the compiler's private vocabulary
+  ## leaking into the UI.
+  ##
+  ## `NoSym` means the kind was not resolved, and printing the enum's own name for
+  ## it is strictly worse than printing nothing, so it maps to the empty string and
+  ## the caller leaves the kind out. That is the lexical path's existing rule
+  ## (`decl.declarationKind`, or "symbol"), applied to the semantic path.
+  ##
+  ## The map belongs here rather than in `writeIdeQuery`: the sidecar's job is to
+  ## say what sem knows, and how to say it to a human is this side's decision.
+  case raw
+  of "glet", "tlet": "let"
+  of "gvar", "tvar": "var"
+  of "efld": "enum field"
+  of "fld", "gfld": "field"
+  of "NoSym": ""
+  else: raw
+
 proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   ## Signature line, then the declaration's doc comment when there is one.
   ## Editors show the markdown as a popup, so the doc text goes in as plain
@@ -198,7 +223,9 @@ proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   # not run) still deserves the lexical answer rather than nothing at all.
   if query.candidates.len > 0:
     let symbol = query.candidates[0]
-    var value = "`" & symbol.kind & " " & symbol.name & "`"
+    let kind = displayKind(symbol.kind)
+    var value = if kind.len > 0: "`" & kind & " " & symbol.name & "`"
+                else: "`" & symbol.name & "`"
     if symbol.doc.len > 0:
       if symbol.doc.contains("\n"):
         value.add "\n\n```nim\n" & symbol.doc & "\n```"
@@ -241,10 +268,11 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
       labels.incl name
       if not first: result.add ','
       first = false
-      let kind = if symbol.kind in ["proc", "func", "iterator", "method",
-                                    "template", "macro", "converter"]: 3 else: 20
+      let shown = displayKind(symbol.kind)
+      let kind = if shown in ["proc", "func", "iterator", "method",
+                              "template", "macro", "converter"]: 3 else: 20
       result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
-        ",\"detail\":" & quoteJson(symbol.kind) & "}"
+        ",\"detail\":" & quoteJson(shown) & "}"
     result.add "]}"
     return
   if query.documentMode:
@@ -257,10 +285,11 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
       labels.incl name
       if not first: result.add ','
       first = false
-      let kind = if symbol.kind in ["proc", "func", "iterator", "method",
-                                    "template", "macro", "converter"]: 3 else: 6
+      let shown = displayKind(symbol.kind)
+      let kind = if shown in ["proc", "func", "iterator", "method",
+                              "template", "macro", "converter"]: 3 else: 6
       result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
-        ",\"detail\":" & quoteJson(symbol.kind) & "}"
+        ",\"detail\":" & quoteJson(shown) & "}"
     for id in doc.visible(line, character):
       let n = doc.nodes[id]
       if n.text in labels: continue
@@ -277,10 +306,11 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
       labels.incl name
       if not first: result.add ','
       first = false
-      let kind = if symbol.kind in ["proc", "func", "iterator", "method",
-                                    "template", "macro", "converter"]: 3 else: 6
+      let shown = displayKind(symbol.kind)
+      let kind = if shown in ["proc", "func", "iterator", "method",
+                              "template", "macro", "converter"]: 3 else: 6
       result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
-        ",\"detail\":" & quoteJson(symbol.kind) & "}"
+        ",\"detail\":" & quoteJson(shown) & "}"
   else:
     for id in doc.visible(line, character):
       let n = doc.nodes[id]
