@@ -176,6 +176,35 @@ A document is sem-checked on open and on every change with the track line set to
 and matches no name. One compile therefore serves both the diagnostics and a
 later query. Parser and semantic diagnostics are published together.
 
+## Edit coalescing (not implemented)
+
+`didChange` compiles inline today: the handler calls `runDiagnostics` before it
+returns, and the server's loop is strictly read → handle → respond, so a keystroke
+blocks the next message for the length of one `nimony check` — measured at 5
+keystrokes → 5 checks → 3.96 s with no editor attached. Coalescing would mark the
+document dirty and run the check once the input stream goes quiet, turning a burst
+of keystrokes into one compile.
+
+The requirement that is easy to get wrong is the query. A hover or definition
+arriving while the document is dirty must run *that* check — joining it if one is
+already in flight — answer from its result, and then reset the timer, because the
+work the timer was waiting for has just happened. Both simpler arrangements pay
+twice. If the query forces its own check and the timer runs independently, the
+timer fires again moments later for a document that has not changed since; if the
+timer owns the check alone, the query's forced check is thrown away the moment the
+user types again.
+
+Answering from the previous snapshot is not an option, for the same reason a failed
+compile is reported as a diagnostic rather than as an empty sidecar above: a stale
+answer is indistinguishable from a wrong one to the client. So is `null`, which is
+also what an unresolved position returns, and what every query returned outright
+when sem failed and left the snapshot empty.
+
+Not started, and the mechanism is deliberately undecided. Both `setPassiveWaitHook`
+(`system.nim`) and `.passive` parks exist and `threadpool.nim` uses that pairing,
+but the hook is not optional — a parked coroutine without it busy-waits in
+`builtinCpuRelax` and burns a core.
+
 ## Hover documentation
 
 The parser records every `##` block, keyed by the line the block ends on. A
