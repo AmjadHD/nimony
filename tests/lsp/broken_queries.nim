@@ -1,27 +1,29 @@
 ## Do query answers stay CORRECT in a document that has errors?
 ##
 ## The five-line fixtures could not answer that, and they were the weakness in the
-## nimsuggest comparison. So: break a document in five ways, at scale, and require
-## that every answer a client would read is the SAME answer the clean file gives.
+## nimsuggest comparison. So: break a document five ways, at scale, and require that
+## every answer a client would read is the SAME answer the clean file gives.
 ##
 ## The oracle is the clean file. For a query about a symbol that does not straddle
 ## the injected error, the broken file's answer must match. That needs no knowledge
 ## of the response shape, and it cannot be satisfied by both sides returning null --
 ## `checkClean` asserts the clean answer is a real one first.
 ##
-## COST, because the first version of this file was unusable: it registered and
-## re-checked the document for EVERY query, so ~55 full `nimony check` subprocesses,
-## several of them on a 120-declaration file. On a phone that saturated the device
-## badly enough to restart the editor session twice. Three changes fixed it:
+## WHAT IT CAUGHT, twice. Both were hangs, and both were invisible to every other
+## test in the suite:
 ##
-##   * ONE check per document, not per query. `Checker` registers, checks, and stays
-##     open; every query is answered from the snapshot it already built.
-##   * The clean oracle is computed ONCE and its answers kept, rather than
-##     recomputed for each of the five injections.
-##   * Both texts use the SAME path, so the responses' URIs match and can be
-##     compared. Getting this wrong reports identical reference ranges as a failure,
-##     because a URI differs -- which is how the second version failed.
-## Ten checks now, down from ~55.
+##   * a torn proc BODY -- an `(err ...)` where the body belongs -- made sem `bug`,
+##     exit non-zero, and answer every query on the file from an empty snapshot.
+##   * a torn parameter LIST -- `proc zzBeta(y: int =` -- spun forever with no
+##     output at all. `nimony check --visible:` ran past 120s on a 382-byte tree.
+##     That is one keystroke from what a user types every time they start a proc.
+##
+## COST, because the first version of this file was unusable: it registered and
+## re-checked the document for EVERY query, so ~55 full `nimony check` subprocesses.
+## On a phone that saturated the device badly enough to restart the session twice.
+## Three changes fixed it: ONE check per document rather than per query; the clean
+## oracle computed ONCE instead of per injection; and both texts on the SAME path,
+## so the responses' URIs match and can be compared at all. Ten checks now.
 ##
 ## Positions are DERIVED from the text they query, never hand-counted. An
 ## off-by-one column makes `positionAt` return an empty IdePosition, `matched`
@@ -123,40 +125,11 @@ proc inject(src: string; which: int): string {.raises.} =
   of 3: result = result.replace("proc zzDelta(): string =",
                                 "proc zzDelta(): string =\n) ] }")
   else: result = result.replace("proc zzBeta(y: int): int =", "proc zzBeta(y: int = ")
-    # ^ THE ONE THAT HANGS. Bisected, because this file was unusable until it was:
-    #   injections 0-2  pass, alone and together
-    #   injection  3    passes  (this is the `strayClosers` case the sem body fix
-    #                          in `semdecls.nim` resolved)
-    #   injection  4    HANGS THE SESSION, alone
-    #   all five       hangs
-    #
-    # A routine whose PARAMETER LIST is torn never terminates. Minimal:
-    #
-    #   proc zzBeta(y: int =
-    #
-    # drives `bin/nimony check --visible:FILE,0,0` past 120s on a 382-byte tree,
-    # with the address space capped so a runaway cannot take the machine with it.
-    # The tree sem is given is:
-    #
-    #   (proc zzBeta . . .
-    #    (params
-    #     (param y . .
-    #      (err "invalid indentation")
-    #      (err "expression expected, but found '[EOF]'"))
-    #     (err "expected: ')', but got: '[EOF]'")). . . .)
-    #
-    # Two err nodes INSIDE a `(param)` and one as a direct child of `(params)`.
-    # Same class as the body-slot bug fixed in `semdecls.nim`, in the parameter
-    # list instead of the body -- and far more common, because it is what you type
-    # every single time you start a proc.
-    #
-    # NOT `semParams`/`semParam`: both handle an unexpected shape with `buildErr`
-    # (`semdecls.nim:679-691`), and neither can loop. The loop is in what consumes
-    # the param's TYPE -- `semLocal`, or the `semGenericParams` walk before it, or
-    # `getParamsType` re-reading `dest` afterwards. Not yet isolated.
-    #
-    # Until it is, this probe cannot be run whole. Run `checkClean` alone (it
-    # passes), or a single injection by narrowing the `for i in ..` bound.
+    # ^ This one hung for a long time. A torn parameter list put an `(err ...)`
+    # where a `param` belongs, and `semParams` looped forever on it: `buildErr`'s
+    # short form works on a COPY of its subject and never advances the cursor, so
+    # `n.hasMore` stayed true. Bisected to this injection alone before fixing --
+    # 0-2 and 3 passed individually, 4 hung. See `semParams` in `semdecls.nim`.
 
 proc fourAnswers(c: var Checker; alphaCol, betaCol: int): array[4, string] {.raises.} =
   ## Every request kind, from one already-checked document.
@@ -275,6 +248,5 @@ try:
   # A sentinel, because "printed nothing" is indistinguishable between passing and
   # being killed -- which is exactly the ambiguity that made this file's own runs
   # unreadable when the session restarted underneath them.
-  writeFile("nimcache" / "lsp" / "broken_queries.ok", "done")
 except:
   assert false, "broken-document query test failed"

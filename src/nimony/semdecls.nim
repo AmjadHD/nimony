@@ -683,12 +683,37 @@ proc semParam(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
     buildErr c, dest, n.info, "expected 'param'"
 
 proc semParams(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
+  ## A recovering parse can put an `(err ...)` where a `param` belongs, and that
+  ## HANGS THE COMPILER.
+  ##
+  ##   proc zzBeta(y: int =
+  ##
+  ## is one keystroke away from being what the user is typing, and it left sem
+  ## spinning with no output at all -- `nimony check --visible:` ran past 120s on
+  ## the 382-byte tree the parser produced. Nothing in the editor can survive that.
+  ##
+  ## The cause is one line. `buildErr`'s short form does NOT consume its subject: it
+  ## builds `orig` as a FRESH buffer (`sembasics.nim:388`) and works on that copy.
+  ## So the old
+  ##
+  ##     while n.hasMore: semParam c, dest, n
+  ##
+  ## reached `semParam` with an error node, took its `else` branch, reported
+  ## "expected 'param'" onto a copy, and left `n` exactly where it was. `hasMore`
+  ## stayed true forever.
+  ##
+  ## An error node is passed through rather than reported a second time, which is
+  ## the rule the `effects` slot and `semBodyCheckBody` already follow -- and
+  ## `takeTree` is what consumes it.
   if n.isDotToken:
     takeTree dest, n
   elif n.substructureKind == ParamsU:
     takeInto dest, n:
       while n.hasMore:
-        semParam c, dest, n
+        if n.substructureKind == ParamU:
+          semParam c, dest, n
+        else:
+          takeTree dest, n
   else:
     buildErr c, dest, n.info, "expected '.' or 'params'"
 
