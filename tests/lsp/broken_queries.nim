@@ -80,9 +80,11 @@ proc openChecked(text, rel: string): Checker {.raises.} =
   # wants the result provably initialised, and an object holding a `Database` does
   # not get that from three separate writes.
   result = Checker(uri: uriFor(rel), diagnostics: 0)
-  writeFile(workDir() / rel, text)
-  result.uri = uriFor(rel)
+  # initDatabase FIRST: it is the proc that creates `nimcache/lsp`
+  # (`database.nim`), so writing the fixture before it means the write only
+  # succeeds because some earlier run happened to leave that directory behind.
   result.db = initDatabase(getCurrentDir())
+  writeFile(workDir() / rel, text)
   var d = result.db.updateDocument(result.uri, workDir() / rel, 1, text)
   result.db.runDiagnostics(d)
   result.diagnostics = d.diagnostics.len + d.semanticDiagnostics.len
@@ -230,6 +232,9 @@ proc checkAtScale(count: int) {.raises.} =
   let gotBelow = bc.ask("textDocument/definition", params(bc.uri, below, 11))
   assert bc.diagnostics > 0, "at scale: the injection produced no diagnostic"
 
+  assert hoverSymbol(cleanAbove).len > 0,
+         "at scale (" & $count & " decls): the CLEAN file's hover answered nothing " &
+         "above the error, so agreeing with it below would prove nothing: " & cleanAbove
   assert hoverSymbol(gotAbove) == hoverSymbol(cleanAbove),
          "at scale (" & $count & " decls): hover ABOVE the error changed\n  clean:  " &
          cleanAbove & "\n  broken: " & gotAbove
@@ -240,13 +245,14 @@ proc checkAtScale(count: int) {.raises.} =
 try:
   checkClean()
   checkAnswersSurvive()
-  # 12 and 24 rather than 20 and 120: a full compile of the big module is the
-  # single most expensive thing here, and 24 chained declarations is already far
-  # enough past a toy fixture to catch a resync that discards the rest of a file.
-  for n in [12, 24]:
+  # 120 declarations -- the size this was designed for, and the one that had never
+  # actually run. It was cut down to 12 and 24 while a torn parameter list still
+  # hung the compiler, and the workload was blamed. It was not the workload: one
+  # injection out of five, run alone, looped forever in `semParams`. With that fixed
+  # the only remaining cost is an ordinary compile of a 360-line module, so the
+  # number goes back up. 12 stays as the cheap case that fails first if the
+  # mechanism itself breaks, rather than at some size where the diagnosis is buried.
+  for n in [12, 120]:
     checkAtScale(n)
-  # A sentinel, because "printed nothing" is indistinguishable between passing and
-  # being killed -- which is exactly the ambiguity that made this file's own runs
-  # unreadable when the session restarted underneath them.
 except:
   assert false, "broken-document query test failed"
