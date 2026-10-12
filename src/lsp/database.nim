@@ -34,6 +34,10 @@ type
     ## which needs no qualifier, and for one whose declaring file the row did not
     ## name -- a builtin, say.
     module*: string
+    ## What follows a routine's name in its own declaration -- `(): string`.
+    ## Empty for anything that is not a routine, and for a declaration this could
+    ## not read, because a partial signature is worse than none.
+    signature*: string
     range*: SourceRange
 
   IdePosition* = object
@@ -1068,6 +1072,122 @@ proc moduleDocAt(doc: Document; source: string): string =
       found = docText
   found
 
+proc stripPragmas(s: string): string =
+  ## Drop `{...}` groups, which are where a pragma run sits between a return type
+  ## and the body's `=`: `string {.tags: [ReadIOEffect], raises: [].}` is a
+  ## signature of `string` to a reader, and the rest is noise.
+  result = ""
+  var depth = 0
+  for ch in s:
+    if ch == '{':
+      inc depth
+    elif ch == '}':
+      if depth > 0: dec depth
+    elif depth == 0:
+      result.add ch
+
+proc signatureTailAt(index: ref FileIndex; startLine: int; name: string): string =
+  ## What follows a routine's NAME in its own declaration: `(): string`.
+  ##
+  ## Parsed, not scraped. The declaration head runs to the body's `=` at bracket
+  ## depth zero, and scraping to that `=` picks up everything in between -- the
+  ## pragma run of `proc getAppFilename*(): string {.tags: [...]} =` being the
+  ## ordinary case, and a defaulted parameter's own `=` being the trap that makes
+  ## a plain "first `=`" rule wrong.
+  ##
+  ## So: the parameter list by matching brackets, then the return type up to the
+  ## `=` or the end of the line. That covers the shapes a declaration actually
+  ## takes here. A return type wrapped over lines comes back short, which loses
+  ## part of a signature rather than inventing one.
+  if startLine < 0 or startLine >= index.lines.len: return ""
+  var text = ""
+  for i in startLine ..< min(startLine + 20, index.lines.len):
+    if i > startLine: text.add " "
+    text.add index.lines[i]
+  # Find the name rather than stepping over it by length from the line's start:
+  # it does not begin at column zero -- `  proc getAppFilename*()` puts it at 7 --
+  # so advancing by its length from the start of the line lands inside the
+  # identifier and reads every indented declaration as having no signature.
+  var at = text.find(name)
+  if at < 0: return ""
+  at += name.len
+  while at < text.len and text[at] in {' ', '\t'}: inc at
+  # What sits between a routine's name and its parameter list: the export marker
+  # of `proc getAppFilename*()`, and the type parameters of `proc map[T](x: T)`.
+  # Both are recorded under a name that does not include them, so skipping only
+  # whitespace lands on `*` or `[` and reads every exported, generic routine as
+  # having no signature at all.
+  if at < text.len and text[at] == '*': inc at
+  while at < text.len and text[at] in {' ', '\t'}: inc at
+  if at < text.len and text[at] == '[':
+    var bdepth = 0
+    while at < text.len:
+      if text[at] == '[': inc bdepth
+      elif text[at] == ']':
+        dec bdepth
+        inc at
+        if bdepth == 0: break
+        continue
+      inc at
+    while at < text.len and text[at] in {' ', '\t'}: inc at
+  if at >= text.len or text[at] != '(':
+    # No parameter list on this line. A routine always has one, so this is a
+    # declaration we could not read; better no signature than a wrong one.
+    return ""
+  # From the OPENING paren, not from after the list: the tail is what follows the
+  # NAME, and for a routine that includes its own `()` -- `proc foo(): string`,
+  # not `proc foo: string`, which reads as though it took no arguments.
+  let paramsStart = at
+  var depth = 0
+  while at < text.len:
+    if text[at] == '(': inc depth
+    elif text[at] == ')':
+      dec depth
+      if depth == 0:
+        inc at
+        break
+    inc at
+  let afterParams = at
+  while at < text.len and text[at] in {' ', '\t'}: inc at
+  if at < text.len and text[at] == ':':
+    var rdepth = 0
+    while at < text.len:
+      let ch = text[at]
+      if ch == '(' or ch == '[' or ch == '{': inc rdepth
+      elif ch == ')' or ch == ']' or ch == '}': dec rdepth
+      elif ch == '=' and rdepth == 0: break
+      elif ch == '\n' and rdepth == 0: break
+      inc at
+    result = text[paramsStart ..< at]
+  else:
+    result = text[paramsStart ..< afterParams]
+  result = stripPragmas(result)
+  # One line, one space: a signature wrapped in the source reads as one here.
+  var flat = ""
+  var lastSpace = false
+  for ch in result:
+    if ch in {' ', '\t', '\n'}:
+      if not lastSpace and flat.len > 0: flat.add ' '
+      lastSpace = true
+    else:
+      flat.add ch
+      lastSpace = false
+  flat.strip
+
+const
+  ## The kinds a `()` signature is meaningful for. Narrow on purpose: a `let` or a
+  ## `type` has no signature to show, and reaching for one there would mean
+  ## parsing a declaration shape that has none.
+  RoutineKinds = ["proc", "func", "iterator", "converter", "method", "macro",
+                  "template"]
+
+proc signatureFor(doc: Document; source, kind, name: string; lineNo: int): string =
+  ## The shared rule, for the same reason `moduleQualifier` is shared: the
+  ## sidecar reader and the in-process reader ask this twice.
+  if source.len == 0 or kind notin RoutineKinds: return ""
+  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  signatureTailAt(doc.fileIndex(path), lineNo - 1, name)
+
 proc moduleQualifier(doc: Document; source, kind: string): string =
   ## The `mod.` a symbol is written with, or "" when it needs none.
   ##
@@ -1122,6 +1242,7 @@ proc symbolFromFields(doc: Document; fields: seq[string];
     return
   result.doc = if fields[2] == "module": moduleDocAt(doc, source)
                else: doc.docCommentAt(source, lineNo, column, fields[1])
+  result.signature = signatureFor(doc, source, fields[2], fields[1], lineNo)
   result.range = doc.sourceRange(source, lineNo, column, fields[1])
 
 proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
@@ -1278,6 +1399,7 @@ proc symbolAtInfo(doc: Document; name, kind: string; lineNo, column: int;
     return SemanticSymbol(name: name, kind: kind, uri: "", range: SourceRange())
   SemanticSymbol(name: name, kind: kind, uri: doc.uriForPath(source),
                  module: moduleQualifier(doc, source, kind),
+                 signature: signatureFor(doc, source, kind, name, lineNo),
                  range: doc.sourceRange(source, lineNo, column, name),
                  doc: doc.docCommentAt(source, lineNo, column, name))
 

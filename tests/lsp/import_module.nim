@@ -181,6 +181,44 @@ proc checkModuleWithoutDocShowsNone() {.raises.} =
   assert not hover.contains("\\n\\n"),
          "a module with no doc comment showed a doc anyway: " & hover
 
+proc checkSignatureIsShown() {.raises.} =
+  ## Hover used to read "proc os.getAppFilename", which says nothing about what
+  ## the proc takes or gives back. The tail after the name -- "(): string" -- is
+  ## read from the declaration the row already names.
+  ##
+  ## Parsed, not scraped. Taking "everything up to the `=`" would stop at a
+  ## DEFAULTED PARAMETER's own `=` and report `(a: int` as the signature, so the
+  ## parameter list is matched by brackets and the return type read after it.
+  let src = "import std/os\n" &
+            "import std/sequtils\n" &
+            "\n" &
+            "proc zzLocal(a: int; b: int = 3): seq[int] =\n" &
+            "  @[a]\n" &
+            "\n" &
+            "proc zzBare(q: int) =\n" &
+            "  discard q\n" &
+            "\n" &
+            "let r0 = @[1, 2].map(x => x + 1)\n" &
+            "let r1 = getAppFilename()\n" &
+            "let r2 = zzLocal(1)\n" &
+            "let r3 = zzBare(1)\n"
+  var c = openChecked(src, "imp_signature.nim")
+  # Exported, generic, and carrying a pragma run before the body's `=`.
+  let std = c.ask("textDocument/hover", 10, colOf(src, "getAppFilename", 10))
+  assert std.contains("os.getAppFilename(): string"),
+         "a stdlib proc's signature is missing or wrong: " & std
+  let gen = c.ask("textDocument/hover", 9, colOf(src, "map", 9))
+  assert gen.contains("openArray[T]") and gen.contains("): seq["),
+         "a generic proc's type parameters or return are missing: " & gen
+  # A default value must not be mistaken for the end of the signature.
+  let local = c.ask("textDocument/hover", 11, colOf(src, "zzLocal", 11))
+  assert local.contains("(a: int; b: int = 3): seq[int]"),
+         "a local proc's params, default or return type are not all shown: " & local
+  # No return type means none is invented.
+  let bare = c.ask("textDocument/hover", 12, colOf(src, "zzBare", 12))
+  assert bare.contains("(q: int)") and not bare.contains("(q: int):"),
+         "a proc with no return type gained one: " & bare
+
 try:
   checkBareName()
   checkFromImport()
@@ -191,5 +229,6 @@ try:
   checkSymbolIsQualified()
   checkModuleDocIsTheModulesOwn()
   checkModuleWithoutDocShowsNone()
+  checkSignatureIsShown()
 except:
   assert false, "module-name-in-import query test failed"

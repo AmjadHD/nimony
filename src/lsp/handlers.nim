@@ -229,8 +229,14 @@ proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
     # the one thing a hover exists to settle.
     let shown = if symbol.module.len > 0: symbol.module & "." & symbol.name
                 else: symbol.name
-    var value = if kind.len > 0: "`" & kind & " " & shown & "`"
-                else: "`" & shown & "`"
+    # The signature goes on the label rather than in a separate field: the editor
+    # renders one markdown popup, and `proc os.getAppFilename(): string` answers
+    # "what does it take and give back" where a bare name cannot. It is the tail
+    # after the NAME -- `(): string` -- so it composes with the qualifier rather
+    # than repeating the name the label already carries.
+    let tail = if symbol.signature.len > 0: symbol.signature else: ""
+    var value = if kind.len > 0: "`" & kind & " " & shown & tail & "`"
+                else: "`" & shown & tail & "`"
     if symbol.doc.len > 0:
       if symbol.doc.contains("\n"):
         value.add "\n\n```nim\n" & symbol.doc & "\n```"
