@@ -122,6 +122,25 @@ only place holding both halves. The candidate points at the module's file at lin
 0, because a module has no declaration line, and pointing at the import would make
 go-to-definition jump to where the user is already standing.
 
+A symbol is qualified by its module, so hover reads `os.getAppFilename` rather
+than a bare `getAppFilename` -- without it two same-named symbols from different
+modules are indistinguishable, which is the one thing hover exists to settle. The
+qualifier is DERIVED from the declaring file the sidecar row already carries, so
+no format change was needed, and it is the DEFINING module, which is what
+`qualifiedPath` means in nimsuggest: after `import std/os as m` the answer is still
+`os.foo`. It is computed in one place, `moduleQualifier`, because the sidecar
+reader and the in-process reader ask the same question twice and computing it in
+only one of them is what made the two transports answer hover differently.
+
+A module's hover carries the module's OWN doc block, which `docCommentAt` cannot
+supply: it scans down from a declaration looking for the block below it, and a
+module's candidate points at line 0 of its file, so the block it found was the
+first declaration's. `os` documented `fileExists` until this. `moduleDocAt`
+therefore takes the lowest-starting block that begins before the first line of
+code -- `strutils.nim` and `json.nim` open with one and answer; `os.nim` opens with
+`import` and returns nothing, which is the honest answer, because there is no
+module doc to show.
+
 With `import std/os as m`, `m` is recorded and `os` is not: after an alias the
 path component is not a name the module binds, so answering it would name a symbol
 nothing can refer to. An unresolvable module records nothing and stays an ordinary

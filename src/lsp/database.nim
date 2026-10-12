@@ -29,6 +29,11 @@ type
 
   SemanticSymbol* = object
     name*, kind*, uri*, doc*: string
+    ## The module a symbol is written with, so hover can say `os.getAppFilename`
+    ## rather than a bare `getAppFilename`. Empty for a symbol in this document,
+    ## which needs no qualifier, and for one whose declaring file the row did not
+    ## name -- a builtin, say.
+    module*: string
     range*: SourceRange
 
   IdePosition* = object
@@ -1028,6 +1033,57 @@ proc uriForPath*(doc: Document; source: string): string =
 
 proc resolveNameAt(doc: Document; name: string; line, character: int): seq[int]
 
+proc moduleDocAt(doc: Document; source: string): string =
+  ## The `##` block at the head of `source`, which is how a module is documented.
+  ##
+  ## `docCommentAt` cannot answer this one. It scans DOWN from a declaration
+  ## looking for the block below it, because that is where a declaration's doc
+  ## lives -- and a module's candidate points at line 0 of its file, where the
+  ## block below is the FIRST DECLARATION's. Handing back `fileExists`'s doc as
+  ## `std/os`'s is worse than handing back none.
+  ##
+  ## So the block has to be in the file's header: the lowest-starting one, and
+  ## only if it starts before the first line of code. `strutils.nim` and
+  ## `json.nim` open with a doc block and answer; `os.nim` opens with `import` and
+  ## does not, because there is no module doc to show. Taking the lowest block
+  ## without that test is how `os` came to document `fileExists`.
+  ##
+  ## Empty for the open document, which is not a thing you can import from here.
+  ## A block comment spanning lines is not recognised, so a module documented
+  ## inside one gets nothing rather than the wrong block.
+  if source.len == 0 or source == doc.path: return ""
+  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  let index = doc.fileIndex(path)
+  var firstCode = index.lines.len
+  for i, line in index.lines:
+    let trimmed = line.strip
+    if trimmed.len > 0 and not trimmed.startsWith("#"):
+      firstCode = i
+      break
+  var earliest = high(int)
+  var found = ""
+  for line, docText in index.docs:
+    if line < firstCode and line < earliest:
+      earliest = line
+      found = docText
+  found
+
+proc moduleQualifier(doc: Document; source, kind: string): string =
+  ## The `mod.` a symbol is written with, or "" when it needs none.
+  ##
+  ## SHARED on purpose. `symbolFromFields` answers it from the sidecar row and
+  ## `symbolAtInfo` from the struct, and those are the same question asked twice.
+  ## Deriving it in only one of them is what made the subprocess and in-process
+  ## transports return different hovers for one symbol -- qualified on one side,
+  ## bare on the other -- which `tserver.nim` caught.
+  ##
+  ## The DEFINING module, which is what `qualifiedPath` means in nimsuggest: after
+  ## `import std/os as zzmod` the answer is still `os.foo`. A module is its own
+  ## module, so `import std/os` must not read "os.os", and a symbol in this
+  ## document needs no prefix at all.
+  if source.len == 0 or source == doc.path or kind == "module": return ""
+  moduleNameFromPath(source)
+
 proc symbolFromFields(doc: Document; fields: seq[string];
                       withSource: bool): SemanticSymbol {.raises.} =
   ## `candidate`, `import`, `visible` and `dotmember` rows share a shape: name,
@@ -1052,8 +1108,10 @@ proc symbolFromFields(doc: Document; fields: seq[string];
   ## the row type. That is a judgement, not a proof -- if a handler later wants the
   ## range of an `import`, it must come back here rather than find it empty.
   result = SemanticSymbol(name: fields[1], kind: fields[2], uri: "", doc: "")
+  let declaring = if fields[3].len > 0: realFile(fields[3]) else: ""
+  result.module = moduleQualifier(doc, declaring, fields[2])
   if not withSource: return
-  let source = if fields[3].len > 0: realFile(fields[3]) else: ""
+  let source = declaring
   if source.len == 0: return
   result.uri = doc.uriForPath(source)
   var lineNo, column = 0
@@ -1062,7 +1120,8 @@ proc symbolFromFields(doc: Document; fields: seq[string];
     column = parseInt(fields[5]).int
   except:
     return
-  result.doc = doc.docCommentAt(source, lineNo, column, fields[1])
+  result.doc = if fields[2] == "module": moduleDocAt(doc, source)
+               else: doc.docCommentAt(source, lineNo, column, fields[1])
   result.range = doc.sourceRange(source, lineNo, column, fields[1])
 
 proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
@@ -1218,6 +1277,7 @@ proc symbolAtInfo(doc: Document; name, kind: string; lineNo, column: int;
   if source.len == 0:
     return SemanticSymbol(name: name, kind: kind, uri: "", range: SourceRange())
   SemanticSymbol(name: name, kind: kind, uri: doc.uriForPath(source),
+                 module: moduleQualifier(doc, source, kind),
                  range: doc.sourceRange(source, lineNo, column, name),
                  doc: doc.docCommentAt(source, lineNo, column, name))
 

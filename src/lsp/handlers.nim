@@ -224,8 +224,13 @@ proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   if query.candidates.len > 0:
     let symbol = query.candidates[0]
     let kind = displayKind(symbol.kind)
-    var value = if kind.len > 0: "`" & kind & " " & symbol.name & "`"
-                else: "`" & symbol.name & "`"
+    # `os.getAppFilename`, not a bare `getAppFilename`: without the qualifier two
+    # same-named symbols from different modules are indistinguishable, which is
+    # the one thing a hover exists to settle.
+    let shown = if symbol.module.len > 0: symbol.module & "." & symbol.name
+                else: symbol.name
+    var value = if kind.len > 0: "`" & kind & " " & shown & "`"
+                else: "`" & shown & "`"
     if symbol.doc.len > 0:
       if symbol.doc.contains("\n"):
         value.add "\n\n```nim\n" & symbol.doc & "\n```"

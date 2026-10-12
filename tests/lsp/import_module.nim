@@ -140,6 +140,47 @@ proc checkOtherIdentifiersStillWork() {.raises.} =
   assert c.ask("textDocument/definition", 3, col).contains("os.nim"),
          "go-to-definition on an imported symbol regressed"
 
+proc checkSymbolIsQualified() {.raises.} =
+  ## `getAppFilename` must read as `os.getAppFilename`. Without the module, a bare
+  ## name cannot tell two same-named symbols from different modules apart, which is
+  ## the one thing a hover exists to settle. nimsuggest's `qualifiedPath` does the
+  ## same, and names the DEFINING module: after `import std/os as zzmod` it is
+  ## still `os.foo`, which is why the qualifier is derived from the declaring file
+  ## rather than from what this file happened to alias it to.
+  let src = "import std/os\n\nproc zzProbe(): string =\n  getAppFilename()\n"
+  var c = openChecked(src, "imp_qualified.nim")
+  let hover = c.ask("textDocument/hover", 3, colOf(src, "getAppFilename", 3))
+  assert hover.contains("os.getAppFilename"),
+         "an imported symbol is not qualified by its module: " & hover
+  # A symbol in THIS document needs none, and giving it one would be as wrong as
+  # omitting one from a stdlib symbol.
+  let local = c.ask("textDocument/hover", 2, colOf(src, "zzProbe", 2))
+  assert not local.contains(".zzProbe"),
+         "a symbol in this document was given a module qualifier: " & local
+
+proc checkModuleDocIsTheModulesOwn() {.raises.} =
+  ## `strutils.nim` opens with a doc block, so hovering the module must show THAT.
+  ## It showed `fileExists`'s doc for `std/os` until this: `docCommentAt` scans
+  ## DOWN from the declaration's line, and a module's candidate points at line 0,
+  ## so the block it found was the one under it -- the first declaration's.
+  let src = "import std/strutils\n"
+  var c = openChecked(src, "imp_moddoc.nim")
+  let hover = c.ask("textDocument/hover", 0, colOf(src, "strutils", 0))
+  assert hover.contains("ASCII-focused"),
+         "a module's hover did not carry the module's own doc: " & hover
+
+proc checkModuleWithoutDocShowsNone() {.raises.} =
+  ## `os.nim` opens with `import`, so it has no module doc of its own. Showing the
+  ## first declaration's instead is worse than showing nothing, so the label must
+  ## come back with no doc section at all -- a doc always adds a blank line.
+  let src = "import std/os\n"
+  var c = openChecked(src, "imp_nomoddoc.nim")
+  let hover = c.ask("textDocument/hover", 0, colOf(src, "os", 0))
+  assert hover.contains("`module os`"),
+         "a module without a doc lost its label: " & hover
+  assert not hover.contains("\\n\\n"),
+         "a module with no doc comment showed a doc anyway: " & hover
+
 try:
   checkBareName()
   checkFromImport()
@@ -147,5 +188,8 @@ try:
   checkTwoOnOneLine()
   checkMissingModuleIsQuiet()
   checkOtherIdentifiersStillWork()
+  checkSymbolIsQualified()
+  checkModuleDocIsTheModulesOwn()
+  checkModuleWithoutDocShowsNone()
 except:
   assert false, "module-name-in-import query test failed"
