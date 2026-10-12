@@ -219,6 +219,9 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   note(responses, "sibHover", sibHover.response)
   assert sibHover.response.contains("siblingAnswer"),
          "no hover for the sibling's symbol: " & sibHover.response
+  assert sibHover.response.contains("proc sibling_dep_helper.siblingAnswer(): int"),
+         "the in-process/subprocess hover omitted or changed the procedure signature: " &
+         sibHover.response
   # The helper is not the open document, so its text is read from disk and the
   # block is read with the lexer. Its doc comment is a `##[` run, and the
   # assertion names a phrase from the *last* line of it: a scan that only

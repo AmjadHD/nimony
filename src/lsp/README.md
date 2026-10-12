@@ -241,6 +241,16 @@ but the hook is not optional — a parked coroutine without it busy-waits in
 
 ## Hover documentation
 
+Hovering a routine includes its declaration signature after the qualified name:
+`proc os.getAppFilename(): string`. The sidecar already names the declaration's
+file, line and column, so the LSP reads the tail from that file rather than
+changing the sidecar format. It retains generic parameters, parameter names,
+types and defaults, and an explicit return type; pragmas and comments are omitted,
+and a wrapped declaration is rendered on one line. The same cached-file reader is
+used by the sidecar and in-process transports. If the declaration cannot be read
+as a complete signature, hover leaves the tail out rather than displaying a
+truncated one.
+
 The parser records every `##` block, keyed by the line the block ends on. A
 declaration is documented by the block that *follows* it, because that is where
 a Nim doc comment goes: inline at the end of the declaration, or as the first

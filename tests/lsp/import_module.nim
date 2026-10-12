@@ -12,6 +12,9 @@
 ## recorder by different routes: a bare name, a slash path, an alias, and a
 ## from-import.
 ##
+## The signature cases also pin what a proc hover shows: generic parameters,
+## argument names/types/defaults, optional return type, and a wrapped declaration.
+##
 ## Positions are DERIVED from the text, never hand-counted: an off-by-one column
 ## makes the query return empty and the response well-formed, which is
 ## indistinguishable from the very bug this test is about.
@@ -31,6 +34,14 @@ proc colOf(src, needle: string; line, occurrence = 1): int {.raises.} =
   if line < 0 or line >= lines.len: return
   for _ in 1 .. occurrence:
     result = lines[line].find(needle, result + 1)
+
+proc lineOf(src, needle: string): int {.raises.} =
+  ## The 0-based line holding the first `needle`, so signature tests survive edits
+  ## to the fixture without silently querying an empty position.
+  result = -1
+  let lines = src.splitLines
+  for i in 0 ..< lines.len:
+    if lines[i].find(needle) >= 0: return i
 
 proc params(uri: string; line, character: int): string {.raises.} =
   result = "{\"textDocument\":{\"uri\":\"" & uri &
@@ -186,9 +197,10 @@ proc checkSignatureIsShown() {.raises.} =
   ## the proc takes or gives back. The tail after the name -- "(): string" -- is
   ## read from the declaration the row already names.
   ##
-  ## Parsed, not scraped. Taking "everything up to the `=`" would stop at a
-  ## DEFAULTED PARAMETER's own `=` and report `(a: int` as the signature, so the
-  ## parameter list is matched by brackets and the return type read after it.
+  ## The declaration tail is delimiter-scanned rather than stopped at the first
+  ## `=`: a defaulted parameter has its own, which would truncate `(a: int; b: int
+  ## = 3)` before the return type. The generic and parameter lists are balanced;
+  ## the return type ends at the body's `=`.
   let src = "import std/os\n" &
             "import std/sequtils\n" &
             "\n" &
@@ -198,26 +210,85 @@ proc checkSignatureIsShown() {.raises.} =
             "proc zzBare(q: int) =\n" &
             "  discard q\n" &
             "\n" &
+            "proc c(x: int): int = x\n" &
+            "\n" &
+            "proc zzString(s: string = \")\"): string =\n" &
+            "  s\n" &
+            "\n" &
+            "proc zzMulti(\n" &
+            "  left: int;\n" &
+            "  right: string\n" &
+            "): tuple[\n" &
+            "  left: int,\n" &
+            "  right: string\n" &
+            "] =\n" &
+            "  (left, right)\n" &
+            "\n" &
+            "proc zzForeign(value: int): int {.importc.}\n" &
+            "proc zzAfter(): int = 0\n" &
+            "\n" &
             "let r0 = @[1, 2].map(x => x + 1)\n" &
             "let r1 = getAppFilename()\n" &
             "let r2 = zzLocal(1)\n" &
-            "let r3 = zzBare(1)\n"
+            "let r3 = zzBare(1)\n" &
+            "let r4 = c(1)\n" &
+            "let r5 = zzString()\n" &
+            "let r6 = zzMulti(1, \"x\")\n" &
+            "let r7 = zzForeign(1)\n"
   var c = openChecked(src, "imp_signature.nim")
   # Exported, generic, and carrying a pragma run before the body's `=`.
-  let std = c.ask("textDocument/hover", 10, colOf(src, "getAppFilename", 10))
+  let stdLine = lineOf(src, "getAppFilename")
+  assert stdLine >= 0
+  let std = c.ask("textDocument/hover", stdLine,
+                  colOf(src, "getAppFilename", stdLine))
   assert std.contains("os.getAppFilename(): string"),
          "a stdlib proc's signature is missing or wrong: " & std
-  let gen = c.ask("textDocument/hover", 9, colOf(src, "map", 9))
-  assert gen.contains("openArray[T]") and gen.contains("): seq["),
-         "a generic proc's type parameters or return are missing: " & gen
+  let genLine = lineOf(src, "map")
+  assert genLine >= 0
+  let gen = c.ask("textDocument/hover", genLine, colOf(src, "map", genLine))
+  assert gen.contains("[T, S]") and gen.contains("openArray[T]") and
+         gen.contains("): seq["),
+         "a generic proc's type parameters, params or return are missing: " & gen
   # A default value must not be mistaken for the end of the signature.
-  let local = c.ask("textDocument/hover", 11, colOf(src, "zzLocal", 11))
+  let localLine = lineOf(src, "zzLocal(1)")
+  assert localLine >= 0
+  let local = c.ask("textDocument/hover", localLine,
+                    colOf(src, "zzLocal", localLine))
   assert local.contains("(a: int; b: int = 3): seq[int]"),
          "a local proc's params, default or return type are not all shown: " & local
   # No return type means none is invented.
-  let bare = c.ask("textDocument/hover", 12, colOf(src, "zzBare", 12))
+  let bareLine = lineOf(src, "zzBare(1)")
+  assert bareLine >= 0
+  let bare = c.ask("textDocument/hover", bareLine,
+                   colOf(src, "zzBare", bareLine))
   assert bare.contains("(q: int)") and not bare.contains("(q: int):"),
          "a proc with no return type gained one: " & bare
+  # `c` also occurs in the keyword `proc`. A substring search from column zero
+  # would find that first and miss the declaration's actual name.
+  let shortLine = lineOf(src, "c(1)")
+  assert shortLine >= 0
+  let short = c.ask("textDocument/hover", shortLine, colOf(src, "c", shortLine))
+  assert short.contains("proc c(x: int): int"),
+         "a short proc name was confused with a character in `proc`: " & short
+  # Delimiters inside a string default are data, not the end of the parameter
+  # list; a multiline parameter and return type are still one readable tail.
+  let stringLine = lineOf(src, "zzString()")
+  let stringSig = c.ask("textDocument/hover", stringLine,
+                        colOf(src, "zzString", stringLine))
+  assert stringSig.contains("s: string =") and stringSig.contains("): string"),
+         "a delimiter in a default string truncated the signature: " & stringSig
+  let multiLine = lineOf(src, "zzMulti(1")
+  let multiSig = c.ask("textDocument/hover", multiLine,
+                       colOf(src, "zzMulti", multiLine))
+  assert multiSig.contains("left: int; right: string") and
+         multiSig.contains("): tuple[") and multiSig.contains("right: string"),
+         "a multiline signature was truncated: " & multiSig
+  let foreignLine = lineOf(src, "zzForeign(1)")
+  let foreignSig = c.ask("textDocument/hover", foreignLine,
+                         colOf(src, "zzForeign", foreignLine))
+  assert foreignSig.contains("zzForeign(value: int): int") and
+         not foreignSig.contains("zzAfter"),
+         "a body-less importc signature absorbed the next declaration: " & foreignSig
 
 try:
   checkBareName()
@@ -231,4 +302,4 @@ try:
   checkModuleWithoutDocShowsNone()
   checkSignatureIsShown()
 except:
-  assert false, "module-name-in-import query test failed"
+  assert false, "module-name/signature query test failed"

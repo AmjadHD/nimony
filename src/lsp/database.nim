@@ -1072,75 +1072,174 @@ proc moduleDocAt(doc: Document; source: string): string =
       found = docText
   found
 
-proc stripPragmas(s: string): string =
-  ## Drop `{...}` groups, which are where a pragma run sits between a return type
-  ## and the body's `=`: `string {.tags: [ReadIOEffect], raises: [].}` is a
-  ## signature of `string` to a reader, and the rest is noise.
-  result = ""
-  var depth = 0
-  for ch in s:
-    if ch == '{':
-      inc depth
-    elif ch == '}':
-      if depth > 0: dec depth
-    elif depth == 0:
-      result.add ch
+proc skipQuoted(s: string; at: var int) =
+  ## Move over one Nim string, char, or backtick-quoted identifier. Delimiter
+  ## characters inside one of these are data, not signature structure.
+  let quote = s[at]
+  let triple = quote == '"' and at + 2 < s.len and s[at + 1] == '"' and
+               s[at + 2] == '"'
+  if triple:
+    at += 3
+    while at + 2 < s.len:
+      if s[at] == '\\' and at + 1 < s.len:
+        at += 2
+      elif s[at] == '"' and s[at + 1] == '"' and s[at + 2] == '"':
+        at += 3
+        return
+      else:
+        inc at
+  else:
+    inc at
+    while at < s.len:
+      if s[at] == '\\' and at + 1 < s.len:
+        at += 2
+      elif s[at] == quote:
+        inc at
+        return
+      else:
+        inc at
 
-proc signatureTailAt(index: ref FileIndex; startLine: int; name: string): string =
+proc skipComment(s: string; at: var int) =
+  ## Move over a Nim line comment or nested `#[ ... ]#` block comment.
+  if at >= s.len or s[at] != '#': return
+  if at + 1 < s.len and s[at + 1] == '[':
+    at += 2
+    var depth = 1
+    while at < s.len and depth > 0:
+      if at + 1 < s.len and s[at] == '#' and s[at + 1] == '[':
+        inc depth
+        at += 2
+      elif at + 1 < s.len and s[at] == ']' and s[at + 1] == '#':
+        dec depth
+        at += 2
+      else:
+        inc at
+  else:
+    while at < s.len and s[at] != '\n': inc at
+
+proc continuationLine(s: string; newlineAt, baseIndent: int): bool =
+  ## A declaration head may wrap onto an indented line. An unindented (or
+  ## equally-indented) next declaration ends a body-less/importc signature.
+  var at = newlineAt + 1
+  var indent = 0
+  while at < s.len and s[at] in {' ', '\t'}:
+    inc indent
+    inc at
+  at < s.len and s[at] != '\n' and indent > baseIndent
+
+proc stripPragmas(s: string): string =
+  ## Drop `{.pragma.}` groups, which are where a pragma run sits between a return
+  ## type and the body's `=`: `string {.tags: [ReadIOEffect], raises: [].}` is a
+  ## signature of `string` to a reader, and the pragma is noise. Other braces and
+  ## quoted strings are kept: `"{.}"` in a default value is still source text.
+  result = ""
+  var at = 0
+  while at < s.len:
+    if s[at] in {'"', '\'', '`'}:
+      let start = at
+      skipQuoted(s, at)
+      result.add s[start ..< at]
+    elif s[at] == '#':
+      skipComment(s, at)
+      if result.len > 0 and result[^1] notin {' ', '\t', '\n'}:
+        result.add ' '
+    elif s[at] == '{' and at + 1 < s.len and s[at + 1] == '.':
+      at += 2
+      while at + 1 < s.len and not (s[at] == '.' and s[at + 1] == '}'):
+        if s[at] in {'"', '\'', '`'}:
+          skipQuoted(s, at)
+        elif s[at] == '#':
+          skipComment(s, at)
+        else:
+          inc at
+      if at + 1 < s.len: at += 2
+      if result.len > 0 and result[^1] notin {' ', '\t', '\n'}:
+        result.add ' '
+    else:
+      result.add s[at]
+      inc at
+
+proc signatureTailAt(index: ref FileIndex; startLine, nameColumn: int;
+                      name: string): string =
   ## What follows a routine's NAME in its own declaration: `(): string`.
   ##
-  ## Parsed, not scraped. The declaration head runs to the body's `=` at bracket
-  ## depth zero, and scraping to that `=` picks up everything in between -- the
+  ## Delimiters are matched rather than splitting on commas or the first `=`.
+  ## The declaration head runs to the body's `=` at bracket depth zero, and
+  ## reading to that `=` picks up everything in between -- the
   ## pragma run of `proc getAppFilename*(): string {.tags: [...]} =` being the
   ## ordinary case, and a defaulted parameter's own `=` being the trap that makes
   ## a plain "first `=`" rule wrong.
   ##
-  ## So: the parameter list by matching brackets, then the return type up to the
-  ## `=` or the end of the line. That covers the shapes a declaration actually
-  ## takes here. A return type wrapped over lines comes back short, which loses
-  ## part of a signature rather than inventing one.
+  ## So: the generic parameters and parameter list by matching delimiters, then
+  ## the return type up to the `=`. A malformed or unusually long declaration
+  ## returns no signature rather than a plausible-looking fragment.
   if startLine < 0 or startLine >= index.lines.len: return ""
+  const MaxSignatureLines = 20
+  let scanEnd = min(startLine + MaxSignatureLines, index.lines.len)
   var text = ""
-  for i in startLine ..< min(startLine + 20, index.lines.len):
-    if i > startLine: text.add " "
+  for i in startLine ..< scanEnd:
+    if i > startLine: text.add '\n'
     text.add index.lines[i]
-  # Find the name rather than stepping over it by length from the line's start:
-  # it does not begin at column zero -- `  proc getAppFilename*()` puts it at 7 --
-  # so advancing by its length from the start of the line lands inside the
-  # identifier and reads every indented declaration as having no signature.
-  var at = text.find(name)
-  if at < 0: return ""
-  at += name.len
-  while at < text.len and text[at] in {' ', '\t'}: inc at
-  # What sits between a routine's name and its parameter list: the export marker
-  # of `proc getAppFilename*()`, and the type parameters of `proc map[T](x: T)`.
-  # Both are recorded under a name that does not include them, so skipping only
-  # whitespace lands on `*` or `[` and reads every exported, generic routine as
-  # having no signature at all.
+  # Use the declaration's own name column, not a substring search from line 0.
+  # `proc c()` contains `c` in the keyword `proc` before the actual name; the
+  # source location is how we distinguish the two without guessing from spelling.
+  let firstLine = index.lines[startLine]
+  if name.len == 0: return ""
+  var baseIndent = 0
+  while baseIndent < firstLine.len and firstLine[baseIndent] in {' ', '\t'}:
+    inc baseIndent
+  var nameAt = max(0, min(nameColumn, firstLine.len))
+  var foundName = false
+  while nameAt + name.len <= firstLine.len:
+    let matches = firstLine[nameAt ..< nameAt + name.len] == name
+    let wordName = name.len > 0 and isIdentStart(name[0])
+    let leftBoundary = nameAt == 0 or not isIdentContinue(firstLine[nameAt - 1])
+    let afterName = nameAt + name.len
+    let rightBoundary = afterName == firstLine.len or
+                        not isIdentContinue(firstLine[afterName])
+    if matches and (not wordName or (leftBoundary and rightBoundary)):
+      foundName = true
+      break
+    inc nameAt
+  if not foundName: return ""
+  var at = nameAt + name.len
+  while at < text.len and text[at] in {' ', '\t', '\n', '\r'}: inc at
+  # The exported marker is not part of the symbol name. A generic parameter list
+  # IS: `proc map[T, S](...)` must display `[T, S]`, or the types in its ordinary
+  # parameters refer to undeclared type variables in the hover.
   if at < text.len and text[at] == '*': inc at
-  while at < text.len and text[at] in {' ', '\t'}: inc at
+  while at < text.len and text[at] in {' ', '\t', '\n', '\r'}: inc at
+  var signatureStart = at
   if at < text.len and text[at] == '[':
     var bdepth = 0
     while at < text.len:
-      if text[at] == '[': inc bdepth
+      if text[at] in {'"', '\'', '`'}:
+        skipQuoted(text, at)
+      elif text[at] == '#':
+        skipComment(text, at)
+      elif text[at] == '[': inc bdepth
       elif text[at] == ']':
         dec bdepth
         inc at
         if bdepth == 0: break
         continue
       inc at
-    while at < text.len and text[at] in {' ', '\t'}: inc at
+    if bdepth != 0: return ""
+    while at < text.len and text[at] in {' ', '\t', '\n', '\r'}: inc at
   if at >= text.len or text[at] != '(':
     # No parameter list on this line. A routine always has one, so this is a
     # declaration we could not read; better no signature than a wrong one.
     return ""
-  # From the OPENING paren, not from after the list: the tail is what follows the
-  # NAME, and for a routine that includes its own `()` -- `proc foo(): string`,
-  # not `proc foo: string`, which reads as though it took no arguments.
-  let paramsStart = at
+  # From the opening paren, not after the list: the tail includes its own `()`.
   var depth = 0
   while at < text.len:
-    if text[at] == '(': inc depth
+    if text[at] in {'"', '\'', '`'}:
+      skipQuoted(text, at)
+      continue
+    elif text[at] == '#':
+      skipComment(text, at)
+      continue
+    elif text[at] == '(': inc depth
     elif text[at] == ')':
       dec depth
       if depth == 0:
@@ -1148,19 +1247,28 @@ proc signatureTailAt(index: ref FileIndex; startLine: int; name: string): string
         break
     inc at
   let afterParams = at
-  while at < text.len and text[at] in {' ', '\t'}: inc at
+  if depth != 0: return ""
+  while at < text.len and text[at] in {' ', '\t', '\n', '\r'}: inc at
   if at < text.len and text[at] == ':':
     var rdepth = 0
     while at < text.len:
       let ch = text[at]
-      if ch == '(' or ch == '[' or ch == '{': inc rdepth
+      if ch in {'"', '\'', '`'}:
+        skipQuoted(text, at)
+        continue
+      elif ch == '#':
+        skipComment(text, at)
+        continue
+      elif ch == '(' or ch == '[' or ch == '{': inc rdepth
       elif ch == ')' or ch == ']' or ch == '}': dec rdepth
       elif ch == '=' and rdepth == 0: break
-      elif ch == '\n' and rdepth == 0: break
+      elif ch == '\n' and rdepth == 0 and
+          not continuationLine(text, at, baseIndent): break
       inc at
-    result = text[paramsStart ..< at]
+    if rdepth != 0 or (at == text.len and scanEnd < index.lines.len): return ""
+    result = text[signatureStart ..< at]
   else:
-    result = text[paramsStart ..< afterParams]
+    result = text[signatureStart ..< afterParams]
   result = stripPragmas(result)
   # One line, one space: a signature wrapped in the source reads as one here.
   var flat = ""
@@ -1181,12 +1289,13 @@ const
   RoutineKinds = ["proc", "func", "iterator", "converter", "method", "macro",
                   "template"]
 
-proc signatureFor(doc: Document; source, kind, name: string; lineNo: int): string =
+proc signatureFor(doc: Document; source, kind, name: string;
+                  lineNo, column: int): string =
   ## The shared rule, for the same reason `moduleQualifier` is shared: the
   ## sidecar reader and the in-process reader ask this twice.
   if source.len == 0 or kind notin RoutineKinds: return ""
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
-  signatureTailAt(doc.fileIndex(path), lineNo - 1, name)
+  signatureTailAt(doc.fileIndex(path), lineNo - 1, column, name)
 
 proc moduleQualifier(doc: Document; source, kind: string): string =
   ## The `mod.` a symbol is written with, or "" when it needs none.
@@ -1242,7 +1351,7 @@ proc symbolFromFields(doc: Document; fields: seq[string];
     return
   result.doc = if fields[2] == "module": moduleDocAt(doc, source)
                else: doc.docCommentAt(source, lineNo, column, fields[1])
-  result.signature = signatureFor(doc, source, fields[2], fields[1], lineNo)
+  result.signature = signatureFor(doc, source, fields[2], fields[1], lineNo, column)
   result.range = doc.sourceRange(source, lineNo, column, fields[1])
 
 proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
@@ -1399,7 +1508,7 @@ proc symbolAtInfo(doc: Document; name, kind: string; lineNo, column: int;
     return SemanticSymbol(name: name, kind: kind, uri: "", range: SourceRange())
   SemanticSymbol(name: name, kind: kind, uri: doc.uriForPath(source),
                  module: moduleQualifier(doc, source, kind),
-                 signature: signatureFor(doc, source, kind, name, lineNo),
+                 signature: signatureFor(doc, source, kind, name, lineNo, column),
                  range: doc.sourceRange(source, lineNo, column, name),
                  doc: doc.docCommentAt(source, lineNo, column, name))
 
@@ -1440,10 +1549,11 @@ proc symbolForSym(doc: Document; sym: IdeSymbol; moduleSuffix: string;
   result = doc.symbolAtInfo(name, $sym.kind, lineNo, column, source)
   for id in resolved:
     let n = doc.nodes[id]
-    result = SemanticSymbol(name: name, kind: $sym.kind, uri: doc.uri,
-      range: n.range,
-      doc: doc.docCommentAt(doc.path, n.range.startLine + 1,
-                            n.range.startCharacter, n.text))
+    # Keep the declaration-derived module and signature from `symbolAtInfo`;
+    # cursor resolution only changes the occurrence's range and its doc lookup.
+    result.range = n.range
+    result.doc = doc.docCommentAt(doc.path, n.range.startLine + 1,
+                                  n.range.startCharacter, n.text)
 
 proc snapshotFromQuery*(doc: Document; res: IdeQueryResult; queryLine,
                         queryCharacter: int): SemanticSnapshot {.raises.} =
