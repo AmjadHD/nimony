@@ -683,28 +683,14 @@ proc semParam(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
     buildErr c, dest, n.info, "expected 'param'"
 
 proc semParams(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
-  ## A recovering parse can put an `(err ...)` where a `param` belongs, and that
-  ## HANGS THE COMPILER.
+  ## A recovering parse can put an `(err ...)` where a `param` belongs, and it is
+  ## passed through -- the body-slot rule in `semBodyCheckBody`, in the parameter
+  ## list instead of the body.
   ##
-  ##   proc zzBeta(y: int =
-  ##
-  ## is one keystroke away from being what the user is typing, and it left sem
-  ## spinning with no output at all -- `nimony check --visible:` ran past 120s on
-  ## the 382-byte tree the parser produced. Nothing in the editor can survive that.
-  ##
-  ## The cause is one line. `buildErr`'s short form does NOT consume its subject: it
-  ## builds `orig` as a FRESH buffer (`sembasics.nim:388`) and works on that copy.
-  ## So the old
-  ##
-  ##     while n.hasMore: semParam c, dest, n
-  ##
-  ## reached `semParam` with an error node, took its `else` branch, reported
-  ## "expected 'param'" onto a copy, and left `n` exactly where it was. `hasMore`
-  ## stayed true forever.
-  ##
-  ## An error node is passed through rather than reported a second time, which is
-  ## the rule the `effects` slot and `semBodyCheckBody` already follow -- and
-  ## `takeTree` is what consumes it.
+  ## Consuming it is the part that is easy to get wrong. `buildErr`'s short form
+  ## builds `orig` as a FRESH buffer and works on that copy, so it does NOT advance
+  ## the cursor. Reporting the node from here instead leaves `n` where it was, with
+  ## `n.hasMore` still true, and this loop never ends.
   if n.isDotToken:
     takeTree dest, n
   elif n.substructureKind == ParamsU:
@@ -1033,28 +1019,16 @@ proc semBodyGenericInst(c: var SemContext; dest: var TokenBuf; it: var Item;
                         crucial: CrucialPragma; symId: SymId; beforeParams: int; hk: HookKind) =
   ## Process proc body for generic instantiation pass.
   ## A body that is not `(stmts ...)` is an ERROR NODE: the recovering parser can
-  ## leave an `(err ...)` where a body belongs. This used to `bug`, which is an
-  ## internal error -- so sem exited non-zero, the editor reported a failed compile,
-  ## and every query on that file answered from an empty snapshot. Measured on
-  ## `proc zzDelta(): string =` followed by `) ] }`: `(stmts) expected, but got (err`,
-  ## and signature help over a declaration three lines earlier went to `[]`. A file
-  ## whose only fault is one unfinished line stopped answering entirely.
+  ## leave an `(err ...)` where a body belongs. It is passed through under its own
+  ## tag, the rule the `effects` slot above already follows -- complaining about it
+  ## again would add a bogus diagnostic for a node that is already diagnosed, and
+  ## laundering it into a fabricated `(stmts ...)` would put it somewhere sem will
+  ## then walk.
   ##
-  ## It is the same rule the `effects` slot above already follows: pass an error
-  ## node through rather than reporting a second, bogus complaint about it.
-  ##
-  ## THE MATCHED PAR IS THE WHOLE TRICK, and getting it wrong hangs the compiler.
-  ## The caller emits `dest.addParRi(it.n.endInfo)` for the routine AFTER this
-  ## returns, unconditionally. So whatever leaves here must have opened something,
-  ## or that `)` closes a paren nobody opened and `dest` is unbalanced for every
-  ## pass downstream. An earlier attempt returned early emitting NOTHING, and every
-  ## sem invocation after it -- the probe, `hastur test tests/lsp`, even
-  ## `tests/validator` -- hung the session hard enough to restart it. An unbalanced
-  ## TokenBuf does not fail loudly; it makes later walks run away.
-  ##
-  ## So this emits the error node under its OWN tag rather than a fabricated
-  ## `(stmts ...)`, which keeps the buffer balanced and keeps the diagnosis in the
-  ## tree instead of laundering it into a statement list sem will then walk.
+  ## The matched par is load-bearing. The caller emits `dest.addParRi` for the
+  ## routine AFTER this returns, unconditionally, so returning without opening one
+  ## leaves `dest` unbalanced. That does not fail loudly: it makes every later walk
+  ## run away.
   if it.n.stmtKind != StmtsS:
     dest.addParLe(it.n.cursorTagId, it.n.info)
     takeTree dest, it.n
@@ -1089,28 +1063,16 @@ proc semBodyCheckBody(c: var SemContext; dest: var TokenBuf; it: var Item;
                       beforeGenericParams, beforeParams: int; hookName: string; info: NifLineInfo) =
   ## Process proc body for body checking pass.
   ## A body that is not `(stmts ...)` is an ERROR NODE: the recovering parser can
-  ## leave an `(err ...)` where a body belongs. This used to `bug`, which is an
-  ## internal error -- so sem exited non-zero, the editor reported a failed compile,
-  ## and every query on that file answered from an empty snapshot. Measured on
-  ## `proc zzDelta(): string =` followed by `) ] }`: `(stmts) expected, but got (err`,
-  ## and signature help over a declaration three lines earlier went to `[]`. A file
-  ## whose only fault is one unfinished line stopped answering entirely.
+  ## leave an `(err ...)` where a body belongs. It is passed through under its own
+  ## tag, the rule the `effects` slot above already follows -- complaining about it
+  ## again would add a bogus diagnostic for a node that is already diagnosed, and
+  ## laundering it into a fabricated `(stmts ...)` would put it somewhere sem will
+  ## then walk.
   ##
-  ## It is the same rule the `effects` slot above already follows: pass an error
-  ## node through rather than reporting a second, bogus complaint about it.
-  ##
-  ## THE MATCHED PAR IS THE WHOLE TRICK, and getting it wrong hangs the compiler.
-  ## The caller emits `dest.addParRi(it.n.endInfo)` for the routine AFTER this
-  ## returns, unconditionally. So whatever leaves here must have opened something,
-  ## or that `)` closes a paren nobody opened and `dest` is unbalanced for every
-  ## pass downstream. An earlier attempt returned early emitting NOTHING, and every
-  ## sem invocation after it -- the probe, `hastur test tests/lsp`, even
-  ## `tests/validator` -- hung the session hard enough to restart it. An unbalanced
-  ## TokenBuf does not fail loudly; it makes later walks run away.
-  ##
-  ## So this emits the error node under its OWN tag rather than a fabricated
-  ## `(stmts ...)`, which keeps the buffer balanced and keeps the diagnosis in the
-  ## tree instead of laundering it into a statement list sem will then walk.
+  ## The matched par is load-bearing. The caller emits `dest.addParRi` for the
+  ## routine AFTER this returns, unconditionally, so returning without opening one
+  ## leaves `dest` unbalanced. That does not fail loudly: it makes every later walk
+  ## run away.
   if it.n.stmtKind != StmtsS:
     dest.addParLe(it.n.cursorTagId, it.n.info)
     takeTree dest, it.n
