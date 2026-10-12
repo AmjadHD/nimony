@@ -1007,8 +1007,35 @@ proc hasUntypedOrTypedParam(dest: var TokenBuf; beforeParams: int): bool =
 proc semBodyGenericInst(c: var SemContext; dest: var TokenBuf; it: var Item;
                         crucial: CrucialPragma; symId: SymId; beforeParams: int; hk: HookKind) =
   ## Process proc body for generic instantiation pass.
+  ## A body that is not `(stmts ...)` is an ERROR NODE: the recovering parser can
+  ## leave an `(err ...)` where a body belongs. This used to `bug`, which is an
+  ## internal error -- so sem exited non-zero, the editor reported a failed compile,
+  ## and every query on that file answered from an empty snapshot. Measured on
+  ## `proc zzDelta(): string =` followed by `) ] }`: `(stmts) expected, but got (err`,
+  ## and signature help over a declaration three lines earlier went to `[]`. A file
+  ## whose only fault is one unfinished line stopped answering entirely.
+  ##
+  ## It is the same rule the `effects` slot above already follows: pass an error
+  ## node through rather than reporting a second, bogus complaint about it.
+  ##
+  ## THE MATCHED PAR IS THE WHOLE TRICK, and getting it wrong hangs the compiler.
+  ## The caller emits `dest.addParRi(it.n.endInfo)` for the routine AFTER this
+  ## returns, unconditionally. So whatever leaves here must have opened something,
+  ## or that `)` closes a paren nobody opened and `dest` is unbalanced for every
+  ## pass downstream. An earlier attempt returned early emitting NOTHING, and every
+  ## sem invocation after it -- the probe, `hastur test tests/lsp`, even
+  ## `tests/validator` -- hung the session hard enough to restart it. An unbalanced
+  ## TokenBuf does not fail loudly; it makes later walks run away.
+  ##
+  ## So this emits the error node under its OWN tag rather than a fabricated
+  ## `(stmts ...)`, which keeps the buffer balanced and keeps the diagnosis in the
+  ## tree instead of laundering it into a statement list sem will then walk.
   if it.n.stmtKind != StmtsS:
-    bug "(stmts) expected, but got ", it.n
+    dest.addParLe(it.n.cursorTagId, it.n.info)
+    takeTree dest, it.n
+    dest.addParRi(it.n.endInfo)
+    c.closeScope() # close parameter scope
+    return
   c.openScope() # open body scope
   var resId = SymId(0)
   let bodyStart = dest.len
@@ -1036,8 +1063,35 @@ proc semBodyCheckBody(c: var SemContext; dest: var TokenBuf; it: var Item;
                       kind: SymKind; crucial: CrucialPragma; symId: SymId;
                       beforeGenericParams, beforeParams: int; hookName: string; info: NifLineInfo) =
   ## Process proc body for body checking pass.
+  ## A body that is not `(stmts ...)` is an ERROR NODE: the recovering parser can
+  ## leave an `(err ...)` where a body belongs. This used to `bug`, which is an
+  ## internal error -- so sem exited non-zero, the editor reported a failed compile,
+  ## and every query on that file answered from an empty snapshot. Measured on
+  ## `proc zzDelta(): string =` followed by `) ] }`: `(stmts) expected, but got (err`,
+  ## and signature help over a declaration three lines earlier went to `[]`. A file
+  ## whose only fault is one unfinished line stopped answering entirely.
+  ##
+  ## It is the same rule the `effects` slot above already follows: pass an error
+  ## node through rather than reporting a second, bogus complaint about it.
+  ##
+  ## THE MATCHED PAR IS THE WHOLE TRICK, and getting it wrong hangs the compiler.
+  ## The caller emits `dest.addParRi(it.n.endInfo)` for the routine AFTER this
+  ## returns, unconditionally. So whatever leaves here must have opened something,
+  ## or that `)` closes a paren nobody opened and `dest` is unbalanced for every
+  ## pass downstream. An earlier attempt returned early emitting NOTHING, and every
+  ## sem invocation after it -- the probe, `hastur test tests/lsp`, even
+  ## `tests/validator` -- hung the session hard enough to restart it. An unbalanced
+  ## TokenBuf does not fail loudly; it makes later walks run away.
+  ##
+  ## So this emits the error node under its OWN tag rather than a fabricated
+  ## `(stmts ...)`, which keeps the buffer balanced and keeps the diagnosis in the
+  ## tree instead of laundering it into a statement list sem will then walk.
   if it.n.stmtKind != StmtsS:
-    bug "(stmts) expected, but got ", it.n
+    dest.addParLe(it.n.cursorTagId, it.n.info)
+    takeTree dest, it.n
+    dest.addParRi(it.n.endInfo)
+    c.closeScope() # close parameter scope
+    return
   c.openScope() # open body scope
   var resId = SymId(0)
   let bodyStart = dest.len

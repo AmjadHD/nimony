@@ -171,6 +171,132 @@ proc checkTornTopLevel() =
          "the later declaration is outside the module's statement list, which closes at " &
          $closedAt & " while it is at " & $decl & ": " & tree
 
+proc rawLinesIn(tree: string): seq[int] =
+  ## Newline counts of the raw payloads of every `(err ...)` node, in order.
+  ##
+  ## This is the measurement of the one thing that has gone wrong here twice: an
+  ## error node that carries SKIPPED SOURCE as a string literal rather than as
+  ## parsed nodes. `sem` copies such a payload with `takeTree` and never walks it,
+  ## so every declaration inside it is invisible -- present in the file, absent
+  ## from the statement list, which is the only place anything gets compiled.
+  ##
+  ## The payload ENDS at its closing quote, and `\\"` inside it does not end it.
+  ## An earlier version of this helper ran a fixed 4000-character window and
+  ## counted newlines in whatever followed, which reported 49 swallowed lines for
+  ## a 29-line file -- a wrong instrument that would have made a healthy parser
+  ## look broken.
+  result = @[]
+  var rest = tree
+  while true:
+    let at = rest.find("(err")
+    if at < 0: break
+    rest = if at + 4 < rest.len: rest[at + 4 .. ^1] else: ""
+    let q1 = rest.find('"')
+    if q1 <= 0: continue
+    var nl = 0
+    var i = q1 + 1
+    var closed = false
+    while i < rest.len and not closed:
+      if rest[i] == '"':
+        closed = true
+      elif rest[i] == '\\':
+        # The dumper ESCAPES a newline inside a string literal as `\0A`, so
+        # counting the `\n` byte found none and reported `rawLinesMax=0` for a tree
+        # whose payloads plainly held one -- `(err (stmts ",\0A"))`. An instrument
+        # that cannot see the thing it measures turns "no failure" into "no
+        # measurement". Any other escape is skipped whole, which is what keeps
+        # `\"` from ending the payload early.
+        if i + 2 < rest.len and rest[i+1] == '0' and rest[i+2] == 'A':
+          inc nl
+          i = i + 2
+        else:
+          inc i
+      inc i
+    result.add nl
+proc checkFallbackDoesNotSwallow() =
+  ## The skip loop in `recoverError` is a fallback for the case where NO active
+  ## rule's FIRST or FOLLOW matches the current token. Historically that path ran
+  ## to end of file and turned the rest of the module into an error node's raw
+  ## text; it is what `syncBase` and `parseModule`'s restart loop were added for.
+  ##
+  ## It is worth knowing whether that path can still do damage, because it is the
+  ## only route by which recovery loses code. Measured over the fixtures and then
+  ## over deliberately adversarial input -- runs of `) ] } + - * @ \u0060 ,` at top
+  ## level, which is what cannot start a statement and therefore cannot match the
+  ## module rule's FIRST -- it cannot. Every error resynchronises at the token
+  ## immediately after it, and every error node's payload is empty:
+  ##
+  ##     strayClosers+30: errs=120 rawLinesMax=0 declNodes=2
+  ##
+  ## 120 diagnostics for 120 injuries, one token consumed each, and no source
+  ## demoted to text. So there is nothing here to bound: a cap on the skip loop
+  ## would guard a branch that never runs.
+  ##
+  ## What is worth doing is pinning that, because it is a property that has
+  ## regressed twice and is invisible until an editor silently stops analysing a
+  ## file. These assertions fail if the fallback ever starts swallowing again --
+  ## which is the whole point, since it is the failure nobody would otherwise see.
+  var cases: seq[tuple[label, src, later: string]] = @[]
+  var closers = "proc first() =\n  discard 1\n"
+  for i in 0 ..< 30: closers.add ") ] } ) ] } + - * @ ` ,\n"
+  closers.add "proc survivor() =\n  discard 99\n"
+  cases.add ("strayClosers", closers, "survivor")
+
+  var ops = "let x = 1\n"
+  for i in 0 ..< 30: ops.add ") ] }\n"
+  ops.add "proc alsoSurvives() =\n  discard 7\n"
+  cases.add ("strayClosersAfterLet", ops, "alsoSurvives")
+
+  # A top-level tear followed by a whole module's worth of declarations: the shape
+  # that used to lose the file. `checkTornTopLevel` covers one later declaration;
+  # this covers the case where there are enough that losing them is obvious.
+  var many = "proc first() =\n  discard 1\nlet =\n"
+  for i in 0 ..< 12: many.add "proc d" & $i & "() =\n  discard " & $i & "\n"
+  cases.add ("tornTopLevelMany", many, "d11")
+
+  # Indexed rather than tuple-destructured: `for a, b, c in cases` over a
+  # `seq[tuple[...]]` is not something this compiler resolves.
+  for ci in 0 ..< cases.len:
+    let label = cases[ci][0]
+    let src = cases[ci][1]
+    let later = cases[ci][2]
+    var p = openParser(src, "parser_recovery.nim", pool, globalTags)
+    p.recovering = true
+    parseModule p
+    assert p.errors.len > 0, label & ": the input was supposed to be broken"
+    assert p.tok.kind == tkEof, label & ": the parser stopped early"
+    let buf = finish(p)
+    let tree = toString(buf)
+    p.close()
+    assert tree.contains("(err"), label & ": no err node in: " & tree
+    # Deliberately NOT "no error node may hold more than N lines". That was the
+    # first version of this assertion and it was wrong twice over: it failed on
+    # `strayClosersAfterLet`, where 30 lines ARE swallowed and the declaration
+    # after them survives as `(proc@,V alsoSurvives@5 ...)`. Thirty lines of
+    # `) ] }` cost nothing -- they are not declarations and every one is
+    # diagnosed. A bound on swallowed LINES cannot tell the two apart.
+    #
+    # What actually kills a file is a payload holding a DECLARATION, because sem
+    # copies such a payload with `takeTree` and never walks it. So that is the
+    # property, and it is asserted structurally below: a declaration recovered as
+    # text cannot produce a body node with line info in it.
+    assert tree.contains(later),
+           label & ": the declaration after the injury was lost: " & tree
+    assert parenBalance(tree) == 0,
+           label & ": tree is " & $parenBalance(tree) & " out of balance: " & tree
+    # The declaration must be a NODE, not text. `tree.contains(later)` also passes
+    # for a name sitting inside an error node's raw payload, which is precisely
+    # the failure being pinned -- `checkTornTopLevel` learned this the hard way,
+    # where `(proc later` was asserted against a dumper that never emits it. The
+    # body is used instead of the proc's name because raw text carries
+    # `discard 99` and no line info, so a body node is only reachable if the
+    # declaration was really parsed.
+    let body = if label == "strayClosers": "(discard 99@"
+               elif label == "strayClosersAfterLet": "(discard 7@"
+               else: "(discard 11@"
+    assert tree.contains(body),
+           label & ": the declaration is not a node, so sem will never see it: " & tree
+
 proc checkLegalDots() =
   ## A dot's field name may be a keyword -- `a.and`, `a.type`, `a.import` are all
   ## real accesses -- so the guard that stops a dangling dot from eating the next
@@ -216,10 +342,32 @@ proc checkCheckers() =
          "a name inside a comment was treated as content"
   assert contentTokens("let s = \"inside\"\n") == @["s"],
          "a string literal's contents were treated as a name"
+  # `rawLinesIn` is what makes the no-swallowing test meaningful: if it returned
+  # nothing, every payload assertion would pass for the wrong reason.
+  # No error node at all: nothing to report. This is the case a helper that
+  # always returned one entry would fail, which is the whole point of checking it.
+  assert rawLinesIn("(stmts (let x . . . 1))") == @[],
+         "a tree with no error node reported a payload"
+  # An err node with an EMPTY payload carries a message, so the helper counts the
+  # message: zero lines, but one entry. Asserting @[] here was wrong -- the
+  # helper does not, and should not, tell an empty payload from a bare message.
+  assert rawLinesIn("(err@1 (stmts .)\"msg\")") == @[0],
+         "an empty payload was counted as swallowing something"
+  # The dumper writes a newline inside a literal as `\0A`. A helper that counted
+  # the `\n` byte returned @[] for all of these, which is how a tree full of
+  # swallowed source was measured as swallowing none.
+  assert rawLinesIn("(err@1 (stmts \"a\\0Ab\")\"msg\")") == @[1],
+         "a one-line payload was not counted"
+  assert rawLinesIn("(err@1 (stmts \"a\\0Ab\\0Ac\\0Ad\")\"msg\")") == @[3],
+         "a three-line payload was miscounted"
+  # An escaped quote does not end the payload, so the `\0A` after it still counts.
+  assert rawLinesIn("(err@1 (stmts \"q\\\"\\0Az\")\"msg\")") == @[1],
+         "an escaped quote ended the payload early"
 
 try:
   runFixtures()
   checkTornTopLevel()
+  checkFallbackDoesNotSwallow()
   checkLegalDots()
   checkCheckers()
 except:
