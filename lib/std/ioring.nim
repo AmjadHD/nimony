@@ -14,6 +14,28 @@
 #   echo "client fd=", comps[0].result
 #   shutdown()
 
+## ## Descriptors and `-EAGAIN`
+##
+## - **Readiness backends (epoll, kqueue):** the descriptors of reads, writes,
+##   accepts, `recvfrom` and `sendto` must be `O_NONBLOCK` (see
+##   `submitSetNonBlocking`; accepted sockets do not inherit it everywhere).
+##   The transfer is a plain `read`/`write`/`accept`/`recvfrom`/`sendto`, and a
+##   blocking descriptor would block the polling thread. A wake that finds
+##   nothing to transfer (`EAGAIN`, or `EINTR`) leaves the operation pending
+##   and re-armed, so these operations never complete with `-EAGAIN`.
+## - **io_uring:** the kernel honours the descriptor's own mode.
+##   - On an `O_NONBLOCK` descriptor a read or write can complete with
+##     `-EAGAIN` after a wake that carries no readiness, such as the peer's
+##     half-close (`POLLRDHUP`); callers must handle it. A `submitPollAdd` for
+##     `POLLOUT` also completes at once with only `POLLRDHUP` after a
+##     half-close, so a poll-then-retry needs a back-off.
+##   - On a blocking descriptor the operation parks until it can progress, but
+##     it may occupy an io-wq kernel worker while it does, so a peer that never
+##     reads can pin one worker per connection.
+## - IOCP and WSAPoll sockets are unaffected: Winsock completes asynchronously
+##   or reports `WSAEWOULDBLOCK`, which the WSAPoll backend already treats as
+##   "still pending".
+
 import std / [atomics, threadpool, assertions, ticketlocks]
 import ./ioring/core/[types, slots, backend]
 import ./commonio   # FileMode, FilePermission — `submitOpen`'s arguments
@@ -31,8 +53,8 @@ import ./ioring/platform
 when defined(windows):
   when not defined(nimIoringWsaPoll):
     import ./ioring/backends/iocp   # iocpOwnerLane / iocpWake — lane routing
-when defined(illumos):
-  import ./ioring/backends/event_port
+  import ./ioring/backends/files    # isFileHandle — `closeFd` on a file
+  from std/windows/winlean import Handle, closeHandle
 when defined(posix):
   from std/posix/posix import F_GETFL, F_SETFL, O_NONBLOCK,
                               SOL_SOCKET, SO_REUSEADDR, INADDR_ANY
@@ -137,8 +159,6 @@ proc enqueueOp(op: OpContext) =
   else:
     while not gOpQueues[ioLane()].tryEnqueue(op):
       discard backendRelays.poll(0)
-    when defined(illumos):
-      eventPortWake(ioLane())
 
 proc submitNop*(deadline: Deadline; cont = Continuation(fn: nil, env: nil);
                 resPtr: nil ptr int = nil): SeqNum =
@@ -164,6 +184,10 @@ proc submitTimeout*(deadline: Deadline;
 proc submitRead*(fd: cint; buf: pointer; len: int; deadline: Deadline;
                  cont = Continuation(fn: nil, env: nil);
                  resPtr: nil ptr int = nil): SeqNum =
+  ## Read up to `len` bytes into `buf`. Completes with the byte count (`0` is
+  ## end of file) or a negated error. On the readiness backends `fd` must be
+  ## `O_NONBLOCK` (`submitSetNonBlocking`); on io_uring an `O_NONBLOCK` `fd`
+  ## can complete with `-EAGAIN` (see the module docs).
   result = nextSeqNum()
   var op = OpContext(kind: opRead, fd: fd, seqnum: result,
     read: OpBuf(buf: buf, len: len),
@@ -173,6 +197,10 @@ proc submitRead*(fd: cint; buf: pointer; len: int; deadline: Deadline;
 proc submitWrite*(fd: cint; buf: pointer; len: int; deadline: Deadline;
                  cont = Continuation(fn: nil, env: nil);
                  resPtr: nil ptr int = nil): SeqNum =
+  ## Write up to `len` bytes from `buf`. Completes with the byte count, which
+  ## may be less than `len`, or a negated error. On the readiness backends
+  ## `fd` must be `O_NONBLOCK` (`submitSetNonBlocking`); on io_uring an
+  ## `O_NONBLOCK` `fd` can complete with `-EAGAIN` (see the module docs).
   result = nextSeqNum()
   var op = OpContext(kind: opWrite, fd: fd, seqnum: result,
     write: OpBuf(buf: buf, len: len),
@@ -269,8 +297,9 @@ proc submitReadAt*(fd: cint; buf: pointer; len: int; offset: int64;
   ## Keep the buffer live until completion. Short reads and EOF are legal;
   ## offsets and lengths must be nonnegative. Synchronous fallbacks occupy
   ## the polling lane and cannot be interrupted once the transfer starts.
-  ## On Windows fd is a CRT descriptor (_open/_fileno), not a ring HANDLE
-  ## or socket; close it with the CRT, not closeFd.
+  ## `fd` must be a regular file; on Windows that is a file from `submitOpen`.
+  ## illumos runs these as POSIX AIO: a non-regular `fd` fails with ENOTSUP,
+  ## and more than 64 MiB in flight per lane with EAGAIN.
   result = nextSeqNum()
   enqueueOp(OpContext(kind: opRead, fd: fd, seqnum: result,
     read: OpBuf(buf: buf, len: len), positioned: true, offset: offset,
@@ -280,7 +309,9 @@ proc submitWriteAt*(fd: cint; buf: pointer; len: int; offset: int64;
                     deadline: Deadline; cont = Continuation(fn: nil, env: nil);
                     resPtr: nil ptr int = nil): SeqNum =
   ## Positioned counterpart of submitWrite; does not move the file cursor.
-  ## On Windows fd is a CRT descriptor, as for submitReadAt.
+  ## Same `fd` rules as submitReadAt. A write that times out or is cancelled
+  ## after it started completes with what really happened, which can be
+  ## success: the deadline stops the waiting, not a write already issued.
   result = nextSeqNum()
   enqueueOp(OpContext(kind: opWrite, fd: fd, seqnum: result,
     write: OpBuf(buf: buf, len: len), positioned: true, offset: offset,
@@ -292,6 +323,9 @@ proc submitAccept*(listenFd: cint; deadline: Deadline;
                    peer: nil ptr Sockaddr_storage = nil): SeqNum =
   ## Accept one connection. Completes with the accepted fd, or a negative
   ## result.
+  ##
+  ## On the readiness backends (epoll, kqueue) `listenFd` must be
+  ## `O_NONBLOCK`; a wake that finds no connection leaves the accept pending.
   ##
   ## `peer`, when given, receives the address that connected — the kernel
   ## fills it as part of the accept, so asking costs no syscall. It is written
@@ -336,7 +370,8 @@ proc submitRecvFrom*(fd: cint; buf: pointer; len: int; deadline: Deadline;
                      resPtr: nil ptr int = nil;
                      peer: nil ptr Sockaddr_storage = nil): SeqNum =
   ## Receive one datagram into `buf`. Completes with the number of bytes
-  ## received, or a negative result.
+  ## received, or a negative result. On the readiness backends `fd` must be
+  ## `O_NONBLOCK`.
   ##
   ## `peer`, when given, receives the sender's address — the kernel fills it
   ## as part of the recvfrom, so asking costs no syscall beyond the one that
@@ -356,7 +391,8 @@ proc submitSendTo*(fd: cint; buf: pointer; len: int; sa: Sockaddr_storage;
                    cont = Continuation(fn: nil, env: nil);
                    resPtr: nil ptr int = nil): SeqNum =
   ## Send `buf` as one datagram to `sa`. Completes with the number of bytes
-  ## sent, or a negative result. The address is copied into the op, so it does
+  ## sent, or a negative result. On the readiness backends `fd` must be
+  ## `O_NONBLOCK`. The address is copied into the op, so it does
   ## not need to outlive the call the way `submitConnect`'s does.
   result = nextSeqNum()
   var op = OpContext(kind: opSendTo, fd: fd, seqnum: result,
@@ -472,7 +508,7 @@ proc submitPollRemove*(fd: cint): int {.discardable.} =
   ## drain an op submitted moments ago has no slot yet: this reports `0`, the op
   ## is armed immediately afterwards, and the slot leaks — the exact bug the
   ## proc exists to fix. `pollCompletions` drains for the same reason.
-  ## (`closeFd` still does not, and keeps that narrow gap.)
+  ## (`closeFd` drains only on illumos; elsewhere it keeps that narrow gap.)
   when hasIocp:
     # No safe cancel-without-close here: the kernel owns each op's OVERLAPPED
     # until it acknowledges, and `closesocket` — what aborts them — is what this
@@ -651,6 +687,14 @@ when defined(windows):
     ## issued them — and the drain reports each as `ECancelled`, freeing the
     ## slot; only the lane association is dropped here (backends/iocp.nim,
     ## "Cancellation").
+    ##
+    ## A file `fd` (a narrowed `CreateFileW` HANDLE from `submitOpen`) is
+    ## closed with `CloseHandle`: `closesocket` fails on it and would leak the
+    ## handle. Its ops complete in place on the polling thread (backends/files),
+    ## so none are left in flight to cancel.
+    if isFileHandle(fd):
+      discard closeHandle(cast[Handle](uint(cast[uint32](fd))))
+      return
     when hasIocp:
       if backendRelays.forgetFd != nil:
         backendRelays.forgetFd(fd)
