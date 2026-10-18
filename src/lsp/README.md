@@ -251,37 +251,41 @@ used by the sidecar and in-process transports. If the declaration cannot be read
 as a complete signature, hover leaves the tail out rather than displaying a
 truncated one.
 
-The parser records every `##` block, keyed by the line the block ends on. A
-declaration is documented by the block that *follows* it, because that is where
+A declaration is documented by the block that *follows* it, because that is where
 a Nim doc comment goes: inline at the end of the declaration, or as the first
 statement of its body. A `##` run *above* a declaration documents nothing, so the
-block is looked for below it and never above. The lexer has already merged
-consecutive `##` lines into one token and stripped their indentation, which is
-why a two-paragraph block, a `##[` run and a list inside a comment all come out
-as the author wrote them without this side having to know about any of those
-shapes. A `#` comment is not a doc comment: the lexer never makes it a token, so
-it cannot be mistaken for one.
+block is looked for below it and never above. The text comes from the file index
+-- the project's own lexer over the file's bytes -- for the open document as much
+as for any other file, so the two transports cannot disagree: a two-paragraph
+block, a `##[` run and a list inside a comment all come out as the author wrote
+them, on either side. A `#` comment is not a doc comment: the lexer never makes it
+a token, so it cannot be mistaken for one.
 
-Recording is opt-in (`Parser.keepComments`) and only the editor sets it. The
-grammar's `comment[ COMMENT ]` slot looks like the place for the text and is not:
-`commentStmt` is wired only into the statement lists that name it, so a `##`
-inside an object body reaches `emitLeaf` with no wrapper at all, and emitting a
-string there leaves a bare literal between the fields, which sem reports as
-ill-formed. Keeping the text out of the tree entirely leaves the written NIF
-byte-identical and no consumer able to notice.
+Two positions are tried, in this order: a `##` at the end of the declaration's own
+last line (a wrapped head is skipped by bracket depth, so "last line" means the
+end of the signature), then a block that *starts* the line below -- and it has to
+start its own line. A `##` trailing the *next* declaration's line documents that
+declaration; reading it as the previous one's is how a field without a doc came to
+answer with the next field's. Nim's own docgen draws the line in the same place.
+A block that starts its own line below belongs to the declaration above it, which
+is how the in-body form of the same comment is written.
 
-Imported symbols are still read from the file on disk, because the tree only holds
-the open document -- but they are now read with the project's own lexer rather
-than a line scan, which is what the open document's text is. That is what makes
-the two agree: a `##[` run, a blank `##` between paragraphs and the author's
-indentation come out the same either way. The line scan could only recognise a
-line beginning with `##`, so a block comment contributed just its opening line and
-the rest was lost. `openLexer` interns nothing, so this is safe per query; it is
-one pass over text that was already read from disk, measured at 0.07ms for a
-5-line file and 0.25ms for 869 lines.
+A field is the one symbol this lookup needs help placing. Its symbol is local
+(`x.0`, no module suffix), so the module index has no row for it, and it lives in
+its object type's scope, which no walk of the finished module reaches. Sem
+resolves a field access through the owner type and is the only side that ever
+holds both the access and the declaration, so it records that pair in
+`IdeQuery.fieldDefs`: keyed by the access's own position, and keyed by the
+declaration's for a hover on the field in its object body. By position and not by
+symbol on purpose -- two object types may each declare an `x`, and `makeFieldSym`
+numbers them per type, so both are `x.0`; a symbol-keyed table would answer one
+field's hover with another type's declaration. With a real declaration position
+in hand, find-references on a field works too, and its keys separate the two
+types' declarations (`references.nim` pins both directions).
 
-That leaves one weakness here: it shows a stale copy for another file that is open
-but unsaved. Carrying comments through sem would fix it, and NIF already has the
+Another file that is open but unsaved is still read from disk, so it can show a
+stale copy -- the only revision this side never sees is one the editor has not
+written. Carrying comments through sem would fix it, and NIF already has the
 transport for that -- `NifLineInfo.comment` rides along as a `#...#` decoration
 and `nifbuilder.attachComment` writes it -- but sem propagates it in exactly one
 place today (`templates.nim`), so nothing has ever round-tripped it.

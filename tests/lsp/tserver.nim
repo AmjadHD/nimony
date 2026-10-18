@@ -237,14 +237,15 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   assert sibDef.response.contains("sibling_dep_helper.nim"),
          "definition did not reach the sibling: " & sibDef.response
 
-  # Hover documentation comes from the parser, not from a scan of the text. The
-  # text used to be re-read with a line walk, which could not see a `##[` block
-  # and had to be fooled about indentation; the parser merges the block, strips
-  # it and hands it over, so the awkward shapes come out right for free. A `#`
-  # comment is not documentation and must stay invisible.
+  # Hover documentation comes from the file index: the project's own lexer over
+  # the document's text, keyed by the line a `##` block STARTS on. The text used
+  # to be re-read with a line walk, which could not see a `##[` block and had to
+  # be fooled about indentation; the index merges the block and strips it, so the
+  # awkward shapes come out right for free. A `#` comment is not documentation
+  # and must stay invisible.
   #
-  # Keyed by the line the block ENDS on, so a declaration is documented exactly
-  # when the line above it is where its comment finished.
+  # START line, because that is the side of a block a reader can look for: the
+  # block either shares the declaration's last line or begins the next one.
   # An absolute `file://` URI, which is what an editor actually sends. A bare
   # relative path parses and indexes but does not resolve through hover.
   let docFixturePath = getCurrentDir() / "tests" / "lsp" / "fixtures" /
@@ -265,7 +266,7 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   assert docFixtureDoc != nil,
          "document not stored: " & docFixtureOpened.response & " / " &
          docFixtureOpened.notification
-  let docFixtureComments = docFixtureDoc.docComments
+  let docFixtureComments = docFixtureDoc.openIndex.docs
   # The module header, the one documented field, `simple`, `twoParagraphs`,
   # `blockDoc`, `usesBodyDoc` and the trailing block after `inlineDoc`'s body.
   # Nothing else: the `#` comments and `undocumented` and `nested` have none.
@@ -274,11 +275,11 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   # A `#` comment is not a doc comment, and the two-paragraph and `##[` blocks
   # keep the blank line and the shape the author wrote.
   assert docFixtureComments.getOrDefault(9, "").len == 0
-  assert docFixtureComments.getOrDefault(22, "").contains("- one")
-  assert docFixtureComments.getOrDefault(27, "").contains("It spans lines")
+  assert docFixtureComments.getOrDefault(17, "").contains("- one")
+  assert docFixtureComments.getOrDefault(26, "").contains("It spans lines")
   assert docFixtureComments.getOrDefault(35, "") ==
     "Documents this declaration, not the next one."
-  assert docFixtureComments.getOrDefault(2, "").contains("Second line of it.")
+  assert docFixtureComments.getOrDefault(1, "").contains("Second line of it.")
   assert docFixtureComments.getOrDefault(13, "") == "A simple one-line doc."
   assert docFixtureComments.getOrDefault(7, "").contains("field's own documentation")
   # `undocumented` sits under a `#` comment (line 30) and `nested` under

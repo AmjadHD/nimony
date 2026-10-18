@@ -73,21 +73,11 @@ type
     diagnostics*: seq[ParseDiagnostic]       ## from the recovering parser
     semanticDiagnostics*: seq[ParseDiagnostic] ## from the compiler's sem pass
     snapshot*: SemanticSnapshot  ## every identifier occurrence, from one check
-    docComments*: Table[int, string]
-      ## `##` documentation keyed by the line the block ends on, as the parser
-      ## recorded it -- not re-scanned from the text
     parsedFile*: string
     moduleName*: string
     queryCached*: bool
     queryLine*, queryCharacter*: int
     queryResult*: SemanticSnapshot
-    ## `##` blocks of the OPEN document, keyed by the line a block STARTS on.
-    ##
-    ## The parser hands these over keyed by a block's LAST line, which is a
-    ## different key, and the lookup this replaces walked the whole table per
-    ## call. Derived once per document version rather than kept as a second shape,
-    ## so the two keys cannot drift apart.
-    openDocs*: Table[int, string]
     ## The OPEN document's own `FileIndex`, built once per version.
     ##
     ## Without this, `sourceRange` built it per symbol: `buildFileIndex` splits
@@ -96,10 +86,10 @@ type
     ## Measured at 129,258 calls, 0.32 ms each, 41 seconds of a single keystroke --
     ## almost all of it re-lexing the same buffer over and over.
     ##
-    ## `docCommentAt` never showed this because it answers from `openDocs` and
-    ## returns before reaching an index at all, which is why the cost looked like
-    ## it belonged to the wrong function. A `ref` so handing it out is not a copy
-    ## of the document's text.
+    ## `docCommentAt` used to work around it by answering from a parser-recorded
+    ## table and returning before reaching an index at all, which is why a cost
+    ## this size looked like it belonged to the wrong function. A `ref` so handing
+    ## it out is not a copy of the document's text.
     openIndex*: ref FileIndex
     ## Indexes of every OTHER file this document's queries have touched. Held on
     ## the document and dropped with it, so an edit to any file cannot leave a
@@ -344,16 +334,8 @@ proc updateDocument*(db: var Database; uri, path: string; version: int;
                      version: version, text: text)
   var p = openParser(text, path, pool, globalTags)
   p.recovering = true
-  # Only the editor wants the `##` text: batch parsing leaves the tree exactly
-  # as it was, and the language server is the only caller that sets this.
-  p.keepComments = true
   parseModule p
-  doc.docComments = p.docComments
   doc.openIndex = buildFileIndex(text)
-  doc.openDocs = initTable[int, string]()
-  for key, text in p.docComments:
-    if text.len > 0:
-      doc.openDocs[docBlockFirstLine(text, key)] = text
   # A new version, so a fresh set of other-file indexes: any file that changed
   # under an open buffer has changed without anything telling us.
   doc.otherFiles = OtherFiles(byPath: initTable[string, ref FileIndex]())
@@ -460,7 +442,10 @@ proc sameKeys(a, b: seq[string]): bool {.inline.} =
 proc dedupeKeys(keys: var seq[string]) =
   keys.sort()
   var kept = 0
-  for key in keys:
+  # By index rather than a `for key in keys`: the loop writes back into `keys`,
+  # and the iterator would keep it borrowed for the whole body.
+  for i in 0 ..< keys.len:
+    let key = keys[i]
     if kept > 0 and keys[kept - 1] == key: continue
     keys[kept] = key
     inc kept
@@ -774,18 +759,6 @@ proc resolve*(doc: Document; nodeId: int): seq[int] =
       nearestDepth = depth
     if depth == nearestDepth: result.add candidate.id
 
-proc docBlockFirstLine(text: string; lastLine: int): int =
-  ## The line a recorded `##` block STARTS on, given the line it ends on.
-  ##
-  ## The parser keys the table by a block's last line and keeps the merged token
-  ## text, whose newlines are exactly the block's interior lines -- so the first
-  ## line is the key minus those newlines. Deriving it here rather than keeping a
-  ## second table means the two can never disagree.
-  var first = lastLine
-  for ch in text:
-    if ch == '\n': dec first
-  first
-
 type
   FileIndex* = object
     ## One source file, read and lexed once.
@@ -880,48 +853,48 @@ proc fileIndex(doc: Document; path: string): ref FileIndex =
     result = buildFileIndex("")
   doc.otherFiles.byPath[path] = result
 
-proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
-                   name: string): string =
-  ## The `##` block documenting a declaration.
+proc indexFor(doc: Document; source: string): ref FileIndex =
+  ## The index a declaration's file is read through.
   ##
-  ## For the open document the text is what the parser recorded, which is exact:
-  ## it is the block the lexer actually merged, so a `##[` run, a blank `##` line
-  ## between paragraphs and leading indentation all come out right without this
-  ## function having to know about any of them.
+  ## The open document's own index was already built for this version -- from the
+  ## editor's text, so an edit that has not been saved is still what answers --
+  ## and only another file's has to be read and lexed. One proc because two
+  ## answers are one question: the doc lookup, the range lookup and the signature
+  ## tail all have to agree on WHICH text a declaration is read from, and the
+  ## first thing that happens when they do not is a hover whose range quotes one
+  ## revision while its doc quotes another.
+  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
+  if path == doc.path and doc.openIndex != nil: doc.openIndex
+  else: doc.fileIndex(path)
+
+proc docCommentAt*(doc: Document; source: string; lineNo: int): string =
+  ## The `##` block documenting a declaration.
   ##
   ## A Nim doc comment is written *after* the thing it documents: either inline
   ## at the end of the declaration, or as the first statement of its body. A `##`
-  ## run above a declaration documents nothing, so the block is looked for
-  ## directly below the declaration and never above it. Assuming otherwise is
-  ## what made hover report every documented proc in this tree -- where the
-  ## convention is overwhelmingly the in-body one -- as undocumented.
+  ## run above a declaration documents nothing, so the block is looked for below
+  ## it and never above. Assuming otherwise is what made hover report every
+  ## documented proc in this tree -- where the convention is overwhelmingly the
+  ## in-body one -- as undocumented.
   ##
-  ## `lineNo` arrives 1-based from some call sites and 0-based from others, so
-  ## the line below it is looked for under both readings.
+  ## The text comes from the file index, for the open document as much as for any
+  ## other: the index lexes with the project's own lexer, so a `##[` run, a blank
+  ## `##` line between paragraphs and the author's indentation all come out the
+  ## same on both sides. The parser used to record the open document's blocks
+  ## separately, keyed by the line a block ends on, and the two tables were the
+  ## same text under a different key -- a second mechanism to keep in step for no
+  ## second answer.
   ##
-  ## For any *other* file the tree has nothing -- it only holds the open
-  ## document -- so the text is scanned lexically there, exactly as before. That
-  ## is the remaining weak spot: it reads the file from disk, so it shows a stale
-  ## copy for another open-but-unsaved buffer, and it cannot see a `##[` block.
-  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
-  if path == doc.path:
-    # `lineNo` arrives 1-based from some call sites and 0-based from others, so
-    # the line below the declaration is looked for under both readings.
-    for line in [lineNo, lineNo + 1]:
-      let found = doc.openDocs.getOrDefault(line)
-      if found.len > 0: return found
-    return ""
-  let index = doc.fileIndex(path)
+  ## `lineNo` is the declaration's first line, 1-based.
+  let index = doc.indexFor(source)
   if index.text.len == 0: return ""
-  # Scanned down from the declaration, the same direction as above: a signature
-  # wrapping over several lines is skipped by bracket depth, so the block is still
-  # found under the first statement of the body.
-  # Stepped exactly as the one-shot version stepped, because the off-by-one is
-  # load-bearing rather than incidental: `i` is advanced BEFORE the depth test, so
-  # the break leaves it one line past the declaration, and the block is then
-  # looked for one line further still. Rewriting that as "find the first line at
-  # depth zero" looks equivalent and is not -- it lost every cross-file `##`
-  # block, which is what the suite caught.
+  # The declaration's LAST line: a signature may wrap over several lines, and the
+  # block sits below the head, not below its first line. Stepped exactly as the
+  # one-shot version stepped, because the off-by-one is load-bearing rather than
+  # incidental: `i` is advanced BEFORE the depth test, so the break leaves it one
+  # line past the declaration. Rewriting that as "find the first line at depth
+  # zero" looks equivalent and is not -- it lost every cross-file `##` block,
+  # which is what the suite caught.
   var i = max(0, min(lineNo - 1, index.lines.len - 1))
   var depth = 0
   while i < index.lines.len:
@@ -931,7 +904,22 @@ proc docCommentAt*(doc: Document; source: string; lineNo, col: int;
     inc i
     if depth > 0: continue
     break
-  index.docs.getOrDefault(i + 1)
+  # Inline first: a `##` at the end of the declaration's own last line. That is
+  # the key the block STARTS on, which for a one-line comment is the line the
+  # declaration is on -- `type ZzAlias* = int ## doc` and a field's
+  # `zzPlain*: string ## doc` both live here.
+  let inlineDoc = index.docs.getOrDefault(i)
+  if inlineDoc.len > 0: return inlineDoc
+  # Or a block that starts the line below -- the first statement of the body.
+  # It has to start its own line: a `##` trailing the NEXT declaration's line
+  # documents THAT declaration, and reading it as this one's is how a field
+  # without a doc came to answer with the next field's. Nim's own docgen agrees:
+  # a comment sharing a line with the following declaration is not attached to
+  # the one above it.
+  if i < index.lines.len and index.lines[i].strip.startsWith("##"):
+    let belowDoc = index.docs.getOrDefault(i + 1)
+    if belowDoc.len > 0: return belowDoc
+  ""
 
 proc positionOffset(doc: Document; line, character: int): int =
   result = 0
@@ -963,11 +951,7 @@ proc utf16ColumnTo(text: string; byteColumn: int): int =
 
 proc sourceRange(doc: Document; source: string; line, col: int;
                  name: string): SourceRange {.raises.} =
-  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
-  # The open document's index is already built for this version; only another
-  # file's has to be looked up.
-  let index = if path == doc.path and doc.openIndex != nil: doc.openIndex
-              else: doc.fileIndex(path)
+  let index = doc.indexFor(source)
   let text = index.text
   var byteColumn = col
   if text.len > 0 and name.len > 0:
@@ -1294,8 +1278,7 @@ proc signatureFor(doc: Document; source, kind, name: string;
   ## The shared rule, for the same reason `moduleQualifier` is shared: the
   ## sidecar reader and the in-process reader ask this twice.
   if source.len == 0 or kind notin RoutineKinds: return ""
-  let path = if source.isAbsolute: source else: doc.workspaceRoot / source
-  signatureTailAt(doc.fileIndex(path), lineNo - 1, column, name)
+  signatureTailAt(doc.indexFor(source), lineNo - 1, column, name)
 
 proc moduleQualifier(doc: Document; source, kind: string): string =
   ## The `mod.` a symbol is written with, or "" when it needs none.
@@ -1350,7 +1333,7 @@ proc symbolFromFields(doc: Document; fields: seq[string];
   except:
     return
   result.doc = if fields[2] == "module": moduleDocAt(doc, source)
-               else: doc.docCommentAt(source, lineNo, column, fields[1])
+               else: doc.docCommentAt(source, lineNo)
   result.signature = signatureFor(doc, source, fields[2], fields[1], lineNo, column)
   result.range = doc.sourceRange(source, lineNo, column, fields[1])
 
@@ -1457,7 +1440,7 @@ proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
           if needSource:
             symbol.uri = doc.uriForPath(source)
             symbol.range = doc.sourceRange(source, lineNo, column, fields[1])
-            symbol.doc = doc.docCommentAt(source, lineNo, column, fields[1])
+            symbol.doc = doc.docCommentAt(source, lineNo)
           addSymbol(result, fields[0], symbol)
           continue
         for id in resolved:
@@ -1469,13 +1452,12 @@ proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
           if needSource:
             symbol.uri = doc.uri
             symbol.range = n.range
-            symbol.doc = doc.docCommentAt(doc.path, n.range.startLine + 1,
-                                          n.range.startCharacter, n.text)
+            symbol.doc = doc.docCommentAt(doc.path, n.range.startLine + 1)
           addSymbol(result, fields[0], symbol)
       elif source.len > 0 and needSource:
         addSymbol(result, fields[0], SemanticSymbol(name: fields[1], kind: fields[2],
           uri: doc.uriForPath(source),
-          doc: doc.docCommentAt(source, lineNo, column, fields[1]),
+          doc: doc.docCommentAt(source, lineNo),
           range: doc.sourceRange(source, lineNo, column, fields[1])))
       else:
         # A `visible` row falls through to here too, and wants no source at all.
@@ -1510,7 +1492,7 @@ proc symbolAtInfo(doc: Document; name, kind: string; lineNo, column: int;
                  module: moduleQualifier(doc, source, kind),
                  signature: signatureFor(doc, source, kind, name, lineNo, column),
                  range: doc.sourceRange(source, lineNo, column, name),
-                 doc: doc.docCommentAt(source, lineNo, column, name))
+                 doc: doc.docCommentAt(source, lineNo))
 
 proc symbolForSym(doc: Document; sym: IdeSymbol; moduleSuffix: string;
                   queryLine, queryCharacter: int;
@@ -1552,8 +1534,7 @@ proc symbolForSym(doc: Document; sym: IdeSymbol; moduleSuffix: string;
     # Keep the declaration-derived module and signature from `symbolAtInfo`;
     # cursor resolution only changes the occurrence's range and its doc lookup.
     result.range = n.range
-    result.doc = doc.docCommentAt(doc.path, n.range.startLine + 1,
-                                  n.range.startCharacter, n.text)
+    result.doc = doc.docCommentAt(doc.path, n.range.startLine + 1)
 
 proc snapshotFromQuery*(doc: Document; res: IdeQueryResult; queryLine,
                         queryCharacter: int): SemanticSnapshot {.raises.} =

@@ -14,9 +14,13 @@
 ## * a declaration is an occurrence. sem records the declaration's own name as a
 ##   resolved occurrence, which is what makes `includeDeclaration: false` possible
 ##   rather than something the handler has to reconstruct.
-## * a name that resolved to nothing has no identity. sem records `b.field` with an
-##   empty source file, so every member would carry the same key and find-references
-##   on a field would return every member in the file. It returns none.
+## * a name that resolved to nothing has no identity. An undeclared name carries
+##   no declaration, and two such rows compare equal to each other -- so treating
+##   them as references would make every unresolved name a reference to every
+##   other. It returns none for those.
+## * a field's identity is its DECLARATION, not its symbol. `makeFieldSym` names
+##   fields per type (`field.0`), so two object types each declaring a `field`
+##   share a symbol; the two declarations are what the keys here separate.
 ##
 ## The fixture is an array of lines rather than a block of text so the line numbers
 ## in the expectations are the ones a reader counts. Writing the text as a raw
@@ -60,7 +64,17 @@ const lines = [
   "  wide(y)",                             # 24
   "",                                       # 25
   "proc settled() =",                      # 26
-  "  wide(1)"                              # 27
+  "  wide(1)",                             # 27
+  "",                                      # 28
+  "",                                      # 29
+  "type Crate = object",                   # 30
+  "  field*: string",                      # 31
+  "",                                      # 32
+  "proc other(c: Crate) =",                # 33
+  "  discard c.field",                     # 34
+  "",                                      # 35
+  "proc missing() =",                      # 36
+  "  discard notThere"                     # 37
 ]
 
 let source = lines.join("\n") & "\n"
@@ -243,10 +257,10 @@ proc runTests(inProcess: bool) {.raises.} =
   # truth rather than a failure, and the editor shows it as "no results".
   check(db, uri, "a blank line", 13, 0, true, @[])
 
-  # The member name resolved to nothing, so every member in the file would share one
-  # key if an unresolved row had one. It returns none -- which is honest, and is the
-  # answer a field would get today.
-  check(db, uri, "a member name", 18, 12, true, @[])
+  # A field's declaration AND its use, now that sem records where the field is
+  # declared. It used to answer `[]`: a member resolved to nothing, and every
+  # member in the file would have shared one key if such a row had one.
+  check(db, uri, "a member name", 18, 12, true, @["15:2", "18:12"])
 
   # A call sem could not decide records only the SET it weighed -- `wide(y)` where
   # `y`'s type is unknown leaves both overloads standing. It is not a reference to
@@ -260,6 +274,17 @@ proc runTests(inProcess: bool) {.raises.} =
   # And an undecided call is a reference to itself only: its two candidates' own
   # declarations each resolve to ONE of them, so neither is the set.
   check(db, uri, "an undecided call", 24, 4, true, @["24:2"])
+
+  # `Crate.field` is the same local symbol to `makeFieldSym` as `Box.field` is
+  # (`field.0`), so a key over the symbol would report these two as references to
+  # each other. The declaration is what tells them apart, in both directions.
+  check(db, uri, "a same-named field of another type", 34, 12, true,
+        @["31:2", "34:12"])
+
+  # An undeclared name resolved to nothing, so it has no identity -- not even to
+  # itself. Without that rule every unresolved name would match every other, and
+  # this is the row shape sem leaves for one (`Ident`, no candidates).
+  check(db, uri, "an undeclared name", 37, 10, true, @[])
 
   discard handle(db, closeRequest(uri))
 

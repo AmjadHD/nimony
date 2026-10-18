@@ -132,6 +132,9 @@ type
     exported*: bool
     guarded*: bool # true for gfld fields (cannot be accessed via dot)
     rootOwner*: SymId # generic root of owner type
+    info*: NifLineInfo
+      ## Where the field is declared. The one thing about a field that cannot be
+      ## recovered later, because its symbol carries no owner: see `fieldDefs`.
 
   VisOwner* = object
     ## One frame of `SemContext.visOwner`: an expansion whose body belongs to
@@ -147,6 +150,14 @@ type
     id*: SymId
     kind*: SymKind
     info*: NifLineInfo
+
+  IdeSiteKey* = tuple[file: uint32, line, col: int32]
+    ## Where an identifier occurrence sits, as a table key.
+    ##
+    ## A tuple rather than `NifLineInfo` because that carries a `comment` this
+    ## never wants, and a tuple is what `Table` already takes keys of. `file` is
+    ## the raw `FileId`: the bare name is ambiguous in this module, and only the
+    ## value's identity is ever asked for.
 
   IdeResolution* = object
     ## What one identifier occurrence resolved to. An unresolved name is a
@@ -246,6 +257,21 @@ type
     ## module instead of stopping at the first match, so one compile answers
     ## every cursor position until the text changes.
     positions*: seq[IdeResolution]
+    ## Where a field access resolved to, keyed by the ACCESS's own position.
+    ##
+    ## A field is the one symbol an editor query cannot place afterwards. Its
+    ## symbol is local (`x.0`, no module suffix), so the module index has no row
+    ## for it, and it lives in its object type's scope, which no scope walk from
+    ## a finished module can reach. Sem has both the owner type and the
+    ## declaration cursor in hand at the one moment the answer exists; this is
+    ## that moment recorded.
+    ##
+    ## Keyed by the access rather than by the symbol on purpose: two object types
+    ## may each declare an `x`, and makeFieldSym numbers them per type, so both
+    ## are `x.0`. A table keyed by symbol would answer one field's hover with
+    ## another type's declaration -- the field-level version of the wrong-doc bug
+    ## this whole lookup exists to avoid.
+    fieldDefs*: Table[IdeSiteKey, IdeSymbol]
     ## The module's import table, which does not depend on the cursor.
     imports*: seq[IdeSymbol]
 
@@ -444,6 +470,12 @@ type
       ## it as OkExistingFresh) so the body phase does not redeclare it and the
       ## symbol keeps the same name as if it had never been resolved early.
       ## Persists phase 2 → phase 3; cleared per module at phase-2 start.
+
+proc ideSiteKey*(info: NifLineInfo): IdeSiteKey {.inline.} =
+  ## One occurrence's position, for the tables keyed by where something sits.
+  ## Outside the `type` section on purpose: a routine between two type entries
+  ## ends the section, and every entry after it stops being a type.
+  (info.file.uint32, info.line, info.col)
 
 proc recordFileDep*(c: var SemContext; path: string) =
   ## `path` was read while semchecking this module; see `fileDeps`. Only a

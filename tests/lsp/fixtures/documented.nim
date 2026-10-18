@@ -41,5 +41,6 @@ proc nested*(): int =
   6
 
 proc inlineDoc*(): int = 4
-  ## Not a doc comment for `inlineDoc`: it follows the body, and only a block
-  ## that is the first statement of a body documents the declaration.
+  ## `inlineDoc`'s own doc: an indented block under a one-line body is still the
+  ## first thing after the declaration, and `nim doc` attaches it the same way.
+  ## Only a `##` sharing the NEXT declaration's line belongs to that one.

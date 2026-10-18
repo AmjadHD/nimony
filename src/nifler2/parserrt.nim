@@ -33,7 +33,7 @@
 ## situation nifcore's own `closeTag` is written for -- including the
 ## `ExtendedSuffix` it splices in when a body overflows the 19-bit jump field.
 
-import std / [parseutils, syncio, tables]
+import std / [parseutils, syncio]
 import ".." / lib / nifpools
 import linkedtok
 export linkedtok
@@ -103,8 +103,6 @@ type
     tags*: TagPool         ## the tag pool a flattened buffer is built with
     failed*: bool          ## a batch syntax error ended the parse; see `errorAt`
     recovering*: bool      ## opt-in error recovery for editor parses
-    keepComments*: bool    ## keep `##` text in `docComments`, for editor queries
-    docComments*: Table[int, string] ## `##` text keyed by its last line
     errors*: seq[ParseDiagnostic] ## recovered parser diagnostics
     syncStack: seq[tuple[first, follow: SyncPredicate]]
     syncBase: tuple[first, follow: SyncPredicate]
@@ -385,30 +383,7 @@ proc tupleEnd*(p: var Parser) =
 proc indentError*(p: var Parser) =
   error p, errInvalidIndentation
 
-proc recordDocComment(p: var Parser) =
-  ## Keep the text of a `##` block, keyed by the line it ends on.
-  ##
-  ## The text never enters the tree. The grammar's `comment[ COMMENT ]` slot
-  ## looks like the place for it and is not: `commentStmt` is only wired into
-  ## the statement lists that name it, so a `##` inside an object body arrives
-  ## at `emitLeaf` with no wrapper, and emitting a string there leaves a bare
-  ## literal between the fields, which sem reports as ill-formed. Keeping the
-  ## text out of the tree means the written NIF is unchanged and no consumer can
-  ## notice it.
-  ##
-  ## Keying by the *last* line is what lets a reader attach it without walking
-  ## for a sibling: a declaration documents correctly exactly when the line above
-  ## it is where its comment ended. The lexer has already merged consecutive
-  ## `##` lines into one token and stripped their indentation, so one entry is
-  ## one block, and ordinary `#` comments never reach here.
-  if not p.keepComments or p.tok.kind != tkComment or p.tok.s.len == 0: return
-  var last = int(p.tok.line)
-  for ch in p.tok.s:
-    if ch == '\n': inc last
-  p.docComments[last] = p.tok.s
-
 proc getTok*(p: var Parser) =
-  recordDocComment p
   if p.tok.kind != tkEof:
     p.prevKind = p.tok.kind
     p.prevEndLine = p.lex.lineNumber
@@ -1311,8 +1286,9 @@ proc emitLeaf*(p: var Parser) =
     # and is not: the `commentStmt` production is only wired into the statement
     # lists that name it, so a `##` inside an object body reaches here with no
     # wrapper at all. Emitting a string anyway drops a bare literal between the
-    # fields, which sem reports as ill-formed. So the text is recorded by
-    # position instead and never becomes a node -- see `recordDocComment`.
+    # fields, which sem reports as ill-formed. So the text never becomes a node,
+    # and a consumer that wants it reads the source (the editor's file index
+    # lexes with this same lexer and keys blocks the way a reader looks them up).
     discard
   else:
     # Identifiers, operators and every keyword used as a name. `tkSymbol` is

@@ -265,6 +265,14 @@ proc ideSymbolFor(c: var SemContext; dest: TokenBuf; sid: SymId;
     if loaded.decl.info.isValid: result.info = loaded.decl.info
   else:
     result = c.ideSymbol(dest, sid)
+    if result.kind == NoSym and not result.info.isValid:
+      # A field. `tryLoadSym` cannot name the module its symbol belongs to --
+      # `x.0` carries no module suffix -- and its owner type's scope is not in
+      # the chain `ideSymbol` walks. The access that resolved the field recorded
+      # its declaration under a position key, and `info` is that position here:
+      # the same value went into the tree as this node's own.
+      let field = c.ideQuery.fieldDefs.getOrDefault(ideSiteKey(info))
+      if field.kind != NoSym: result = field
 
 proc walkIdePositions(c: var SemContext; dest: TokenBuf; n: var Cursor;
                       file: FileId; fileName: string) =
@@ -515,6 +523,7 @@ proc enableIdeQuery(c: var SemContext; source: string) =
       info: NifLineInfo(file: pool.filenames.getOrIncl(track.filename),
                         line: track.line, col: track.col),
       name: StrId(0), visible: @[], candidates: @[],
+      fieldDefs: initTable[IdeSiteKey, IdeSymbol](),
       writeSidecar: c.g.config.writeIdeSidecar,
       dotRequest: cursorCompletesMember(source, track.line, track.col))
 

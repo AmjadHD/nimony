@@ -1039,7 +1039,8 @@ proc findObjFieldAux(c: var SemContext; t: Cursor; name: StrId; bindings: Table[
         typ = instantiateType(c, typ, bindings)
       return ObjField(sym: field.name.symId, level: level, typ: typ,
                       exported: not field.exported.isDotToken,
-                      guarded: isGuarded, rootOwner: SymId(0))
+                      guarded: isGuarded, rootOwner: SymId(0),
+                      info: field.name.info)
   if baseType.isDotToken:
     result = ObjField(level: -1)
   else:
@@ -1141,6 +1142,20 @@ proc findObjFieldConsiderVis(c: var SemContext; decl: TypeDecl; name: StrId;
         result = ObjField(level: -1)
   elif bypassVis and result.level == 0:
     result.rootOwner = genericRootSym(decl)
+  if result.level >= 0 and c.ideQuery.enabled:
+    # The only moment where both halves of "where is this field declared" exist:
+    # the access's position (`info`, where the caller will put the symbol use)
+    # and the declaration cursor. See `IdeQuery.fieldDefs` for why it is keyed
+    # by the access and why nothing later can reconstruct it.
+    let symbol = IdeSymbol(id: result.sym,
+                           kind: (if result.guarded: GfldY else: FldY),
+                           info: result.info)
+    c.ideQuery.fieldDefs[ideSiteKey(info)] = symbol
+    # And under the declaration itself, for a hover on the field in its object
+    # body: there the node is a `SymbolDef` whose symbol resolves nowhere, and
+    # this is the only record that can say its kind as well as its position.
+    if result.info.isValid:
+      c.ideQuery.fieldDefs[ideSiteKey(result.info)] = symbol
 
 proc semQualifiedIdent(c: var SemContext; dest: var TokenBuf; module: SymId; ident: StrId; info: NifLineInfo): Sym =
   # mirrors semIdent
@@ -1674,15 +1689,26 @@ proc captureIdeImports*(c: var SemContext; dest: var TokenBuf) =
   ## once so completion can offer imported names without a per-position run.
   if not c.ideQuery.enabled or not c.ideQuery.documentMode: return
   if c.ideQuery.imports.len > 0: return
-  for name in keys(c.importTab):
+  # The names are copied out before lookup: `keys(c.importTab)` holds a borrow of
+  # `c` for as long as the loop runs, and the lookup mutates it. `visibleSymbolsAtCursor`
+  # copies for the same reason.
+  var names = initHashSet[StrId]()
+  for name in keys(c.importTab): names.incl name
+  # `c.ideQuery.imports` is still empty at this point (see the guard above), so
+  # the duplicate check runs against a local list: a `for` over the field would
+  # keep `c` borrowed while `c.ideSymbol` mutates it.
+  var added: seq[SymId] = @[]
+  for name in names:
     var choice = c.visibleDeclarationAtCursor(name, NoLineInfo)
     for sym in symbolUses(choice):
       var seen = false
-      for existing in c.ideQuery.imports:
-        if existing.id == sym:
+      for existing in added:
+        if existing == sym:
           seen = true
           break
-      if not seen: c.ideQuery.imports.add c.ideSymbol(dest, sym)
+      if not seen:
+        added.add sym
+        c.ideQuery.imports.add c.ideSymbol(dest, sym)
 
 proc uniqueTypeCandidate(c: var SemContext; dest: var TokenBuf; choiceAt: int): SymId =
   ## The one type in the symbol choice at `choiceAt`, or `SymId(0)` if there are
