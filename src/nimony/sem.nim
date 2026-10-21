@@ -16,7 +16,7 @@ from std/os import changeFileExt, getCurrentDir, isAbsolute, absolutePath, norma
 include ".." / lib / nifprelude
 include ".." / lib / compat2
 import ".." / lib / [symparser, nifindexes, docpaths, intrinsics]
-import nimony_model, symtabs, builtintypes, decls, asthelpers,
+import nimony_model, staticmatches, symtabs, builtintypes, decls, asthelpers,
   programs, sigconcepts, sigmatch, magics, reporters, nifconfig,
   intervals, xints, typeprops, conceptcache,
   semdata, sembasics, semchecks, semconst, semmagics, semimport, templates, sempragmas, semos, expreval, semborrow, enumtostr, derefs, sizeof, renderer,
@@ -82,7 +82,7 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
             checkBranch(it)
             skip it
             while it.hasMore: skip it
-        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
            WhenU, TypevarsU, CaseU, OfU, StmtsU, ParamsU, PragmasU, EitherU, JoinU,
            UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU, CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
           error "illformed AST: `elif` or `else` inside `if` expected, got ", it
@@ -111,7 +111,7 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
             checkBranch(it)
             skip it
             while it.hasMore: skip it
-        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
            WhenU, TypevarsU, CaseU, StmtsU, ParamsU, PragmasU, EitherU, JoinU,
            UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU, CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
           error "illformed AST: `of`, `elif` or `else` inside `case` expected, got ", it
@@ -189,6 +189,18 @@ proc resolveDeferredLocal(c: var SemContext; ident: StrId): bool
 proc semExprMissingPhases(c: var SemContext; dest: var TokenBuf; it: var Item; firstPhase: SemPhase)
 
 proc semCall(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[SemFlag]; source: TransformedCallSource = RegularCall)
+
+proc semStaticExpr(c: var SemContext; dest: var TokenBuf; it: var Item) =
+  ## `(static x)`, the `static` magic: explicit general CTFE. Evaluate the
+  ## operand at compile time and use the resulting value. This is the only way
+  ## an arbitrary call reaches a `static` parameter; general CTFE is never
+  ## triggered implicitly.
+  var n = it.n
+  inc n # tag
+  var inner = Item(n: n, typ: it.typ)
+  semConstExpr c, dest, inner
+  it.typ = inner.typ
+  skip it.n
 
 proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: int; expected: TypeCursor) =
   if typeKind(expected) == AutoT:
@@ -2072,7 +2084,7 @@ proc addVarargsParameter(c: var SemContext; dest: var TokenBuf; paramsAt: int; i
     if n.substructureKind == ParamsU:
       n = sub(n)
       while n.hasMore:
-        if n.symKind == ParamY:
+        if isParamLike(n.symKind):
           let paramStart = n
           n = sub(n)
           let lit = takeIdent(n)
@@ -2193,7 +2205,7 @@ proc evalConstCaseBranch(c: var SemContext; dest: var TokenBuf; it: var Item; ex
      BitandX, BitorX, BitxorX, BitnotX, EqX, NeqX, LeX, LtX, CastX, ConvX, CallX, CmdX,
      CchoiceX, OchoiceX, PragmaxX, QuotedX, HderefX, DdotX, HaddrX, NewrefX, NewobjX, TupX,
      TupconstrX, TabconstrX, AshrX, BaseobjX, HconvX, DconvX, CallstrlitX, InfixX,
-     PrefixX, HcallX, CompilesX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
+     PrefixX, HcallX, CompilesX, StaticX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
      LowX, TypeofX, UnpackX, FieldsX, FieldpairsX, EnumtostrX, IsmainmoduleX, InstantiationinfoX, DefaultobjX,
      DefaulttupX, DefaultdistinctX, DelayX, Delay0X, SuspendX, ExprX, DoX, ArratX, TupatX,
      PlussetX, MinussetX, MulsetX, XorsetX, EqsetX, LesetX, LtsetX, InsetX, CardX, EmoveX,
@@ -2504,7 +2516,7 @@ proc semAsgn(c: var SemContext; dest: var TokenBuf; it: var Item) =
      BitandX, BitorX, BitxorX, BitnotX, EqX, NeqX, LeX, LtX, CastX, ConvX, CallX, CmdX,
      CchoiceX, OchoiceX, PragmaxX, QuotedX, HderefX, HaddrX, NewrefX, NewobjX, TupX,
      TupconstrX, SetconstrX, TabconstrX, AshrX, BaseobjX, HconvX, DconvX, CallstrlitX, InfixX,
-     PrefixX, HcallX, CompilesX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
+     PrefixX, HcallX, CompilesX, StaticX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
      LowX, TypeofX, UnpackX, FieldsX, FieldpairsX, EnumtostrX, IsmainmoduleX, InstantiationinfoX, DefaultobjX,
      DefaulttupX, DefaultdistinctX, DelayX, Delay0X, SuspendX, ExprX, DoX, ArratX, TupatX,
      PlussetX, MinussetX, MulsetX, XorsetX, EqsetX, LesetX, LtsetX, InsetX, CardX, EmoveX,
@@ -3468,7 +3480,7 @@ proc isIterator(c: var SemContext; dest: var TokenBuf; s: SymId): bool =
   if res.decl.symKind == IteratorY:
     return true
   # First-class iter value: a local/param of `itertype`.
-  if res.decl.symKind in {LetY, VarY, CursorY, ParamY, ConstY, GletY, TletY, GvarY, TvarY}:
+  if res.decl.symKind in {LetY, VarY, CursorY, ParamY, StaticParamY, ConstY, GletY, TletY, GvarY, TvarY}:
     let local = asLocal(res.decl)
     result = local.typ.typeKind == ItertypeT
   else:
@@ -3535,6 +3547,18 @@ proc isIteratorCall(c: var SemContext; dest: var TokenBuf; beforeCall: int): boo
         else: returnsIterType(c, dest, callee)
     else:
       result = false
+
+proc isRecursiveInlineIterCall(c: var SemContext; dest: var TokenBuf; beforeCall: int): bool =
+  ## An inline iterator is expanded into its caller, so one that loops over
+  ## itself would be expanded forever.
+  result = false
+  let callee = childCursor(readonlyCursorAt(dest, beforeCall))
+  if callee.isSymbol:
+    var r = c.routine
+    while r != nil:
+      if r.kind == IteratorY and r.sym == callee.symId:
+        return ClosureP notin r.pragmas and PassiveP notin r.pragmas
+      r = r.parent
 
 proc isIdentCall(c: var SemContext; dest: var TokenBuf; beforeCall: int): bool {.inline.} =
   # A call whose fn is unresolved at sem time and needs re-resolution at
@@ -3625,7 +3649,7 @@ proc tryForLoopPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
           semForLoopTupleVar c, vb, it, loopVarType
         else:
           buildErr c, vb, it.n.info, "tuple types expected, but got: " & typeToString(loopVarType)
-    of NoSub, NilU, NotnilU, UncheckedU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU,
+    of NoSub, NilU, NotnilU, UncheckedU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU,
        StaticTypevarU, EfldU, FldU, GfldU, WhenU, ElifU, ElseU, TypevarsU, CaseU, OfU,
        StmtsU, ParamsU, PragmasU, EitherU, JoinU, CallargsU, ForcallU, ExceptU, FinU,
        DeferexpansionU, NeedtypesU:
@@ -3687,7 +3711,9 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
     # expression of type auto" (nim-lang/nimony#2553).
     discard "already produced an error"
   elif isIteratorCall(c, dest, beforeCall):
-    discard "fine"
+    if isRecursiveInlineIterCall(c, dest, beforeCall):
+      dest.shrink beforeCall
+      buildErr c, dest, callInfo, "recursion is not supported in inline iterators"
   elif dest[beforeCall].kind == TagLit and
       (dest[beforeCall].tagId == TagId(FieldsTagId) or
        dest[beforeCall].tagId == TagId(FieldpairsTagId) or
@@ -3737,7 +3763,9 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
       shrink dest, beforeCall
       semCall c, dest, iterCall, {PreferIterators}
       if isIteratorCall(c, dest, beforeCall):
-        discard "fine"
+        if isRecursiveInlineIterCall(c, dest, beforeCall):
+          dest.shrink beforeCall
+          buildErr c, dest, callInfo, "recursion is not supported in inline iterators"
       elif iterCall.typ.typeKind == UntypedT or
           # for iterators from concepts in generic context:
           isIdentCall(c, dest, beforeCall):
@@ -3771,7 +3799,7 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
           semForLoopTupleVar c, dest, it, iterCall.typ
         else:
           buildErr c, dest, it.n.info, "tuple types expected, but got: " & typeToString(iterCall.typ)
-    of NoSub, NilU, NotnilU, UncheckedU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU,
+    of NoSub, NilU, NotnilU, UncheckedU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU,
        StaticTypevarU, EfldU, FldU, GfldU, WhenU, ElifU, ElseU, TypevarsU, CaseU, OfU,
        StmtsU, ParamsU, PragmasU, EitherU, JoinU, CallargsU, ForcallU, ExceptU, FinU,
        DeferexpansionU, NeedtypesU:
@@ -4678,7 +4706,7 @@ proc caseBranchMatchesExprRaw(c: var SemContext; dest: var TokenBuf; branch, mat
         let value = evalConstIntExpr(c, dest, matched, selectorType)
         if value >= a and value <= b:
           return true
-    of NoSub, NilU, NotnilU, KvU, VvU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+    of NoSub, NilU, NotnilU, KvU, VvU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
        WhenU, ElifU, ElseU, TypevarsU, CaseU, OfU, StmtsU, ParamsU, PragmasU,
        EitherU, JoinU, UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU,
        CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
@@ -4786,7 +4814,7 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
               buildObjConstrFields(c, dest, n, setFields, info, bindings, depth)
           else:
             skip n
-      of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+      of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
          WhenU, ElifU, TypevarsU, CaseU, StmtsU, ParamsU, PragmasU,
          EitherU, JoinU, UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU,
          CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
@@ -6284,6 +6312,8 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
         semDo c, dest, it, whichPass(c)
     of CompilesX:
       semCompiles c, dest, it
+    of StaticX:
+      semStaticExpr c, dest, it
     of CurlyatX:
       semCurlyat c, dest, it
     of AlignofX, OffsetofX:

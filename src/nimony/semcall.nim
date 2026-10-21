@@ -66,7 +66,7 @@ proc addFn(c: var SemContext; dest: var TokenBuf; fn: FnCandidate; fnOrig: Curso
       if n.isSymbolDef:
         inc n # skip the SymbolDef
         if n.isTagLit:
-          if n.exprKind in {DefinedX, DeclaredX, AstToStrX, CompilesX, TypeofX,
+          if n.exprKind in {DefinedX, DeclaredX, AstToStrX, CompilesX, StaticX, TypeofX,
               LowX, HighX, AddrX, EnumtostrX, DefaultobjX, DefaulttupX, DefaultdistinctX,
               ArratX, DerefX, TupatX, SizeofX, InternalTypeNameX, IsX, ProccallX, DelayX,
               BindSymX, BindSymNameX, InstantiationinfoX}:
@@ -87,7 +87,7 @@ proc addFn(c: var SemContext; dest: var TokenBuf; fn: FnCandidate; fnOrig: Curso
               skipToParams paramType
               assert paramType.substructureKind == ParamsU
               inc paramType
-              assert paramType.symKind == ParamY
+              assert isParamLike(paramType.symKind)
               paramType = asLocal(paramType).typ
               if m.inferred.len != 0:
                 paramType = instantiateType(c, paramType, m.inferred)
@@ -436,7 +436,8 @@ proc addConceptBoundMethods(c: var SemContext; fn: StrId; typevar: SymId; cands:
   ## available on `T` inside the body.
   var r = c.routine
   while r != nil:
-    for bound in r.conceptBounds:
+    for i in 0 ..< r.conceptBounds.len:
+      let bound = r.conceptBounds[i]
       if invocationMentions(bound, typevar):
         for cand in conceptMethodsForInvocation(c, fn, bound):
           if not conceptMethodAlreadyListed(cands, cand.typ):
@@ -1316,8 +1317,11 @@ proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: v
       # `(call f (hcall toOpenArray.0[I,T] (aconstr …)))` straight into
       # `dest`. Skipped for templates (`firstVarargMatch` substitution
       # needs the flat args) and macros (their plugin reads `cs.args`).
-      let varargsElem = compatVarargsParamElem(m[idx].fn)
+      var varargsElem = compatVarargsParamElem(m[idx].fn)
       if not cursorIsNil(varargsElem):
+        if m[idx].inferred.len != 0:
+          # generic `varargs[T]`: bundle with the inferred element type
+          varargsElem = instantiateType(c, varargsElem, m[idx].inferred)
         compatBundleVarargsInMatch c, m[idx], varargsElem, cs.callNodeInfo
     addArgsInstConverters(c, dest, m[idx], cs.args)
     leaveCall dest, it, cs
