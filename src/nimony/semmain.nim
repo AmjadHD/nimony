@@ -180,13 +180,18 @@ proc writeOutput(c: var SemContext; dest: var TokenBuf; outfile: string) =
           else:
             echo "  [", k, "] ", tk.kind
         break
+  # Publish the deps file BEFORE the semmed file. A const-eval sub-compile
+  # shares this nimcache with a parallel outer frontend: once it sees the
+  # `.s.nif` it treats the module as semmed and reads the deps file
+  # unconditionally, so the reverse order leaves a window where the semmed
+  # module exists without its deps.
+  writeNewDepsFile c, outfile
   onRaiseQuit writeFile(dest, outfile)
   let root = readonlyCursorAt(dest, 0).info
   onRaiseQuit createIndex(outfile, root, true,
     IndexSections(
       converters: move c.converterIndexMap,
       exportBuf: buildIndexExports(c)))
-  writeNewDepsFile c, outfile
 
 proc dbgCheckSeals*(dest: TokenBuf; label: string) =
   ## `-d:sealCheck` debugging aid: report inconsistent seals per phase.

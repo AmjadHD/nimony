@@ -43,6 +43,16 @@ proc filesBySuffix(cache, suffix: string): seq[string] =
     if f.endsWith(suffix): result.add f
   sort result
 
+proc depsFileForSource(cache, src: string): string =
+  ## The `.s.deps.nif` belonging to `src`'s module. Its sibling `.s.nif` starts
+  ## with the source path, which distinguishes the main module from the rest of
+  ## the cache without recomputing module suffixes here.
+  let wanted = src.replace('\\', '/')
+  for f in filesBySuffix(cache, ".s.deps.nif"):
+    let semmed = f[0 ..< f.len - ".s.deps.nif".len] & ".s.nif"
+    if fileExists(semmed) and readFile(semmed).replace('\\', '/').contains(wanted):
+      return f
+
 proc mainHexedPerBackend(cache: string): seq[(string, string)] =
   ## `(backend directory name, content of the main module's .x.nif)` for every
   ## backend that has built under `cache`. `deps.backendDirName` puts each
@@ -117,6 +127,31 @@ proc incrementalTests*() =
              "noop: frontend re-ran " & $reportField(r[0], "total") & " commands"
       expect reportField(r[1], "total") == 0,
              "noop: backend re-ran " & $reportField(r[1], "total") & " commands"
+
+  # Phase 2b: a const-eval sub-compile shares its nimcache with the outer
+  # frontend, so it can observe the outer nimsem's `.s.nif` before the
+  # `.s.deps.nif` lands. The backend graph reads the deps file unconditionally;
+  # unless it is a declared nimsem output, its absence looks "up to date" and
+  # the build fails with `vfs: open failed`. Delete the main module's deps file
+  # and demand that one rebuild restores it, then settles.
+  block:
+    let deps = depsFileForSource(cache, src)
+    expect deps.len > 0, "deps-missing: could not find the main module's .s.deps.nif"
+    if deps.len > 0:
+      removeFile(deps)
+      let r = run("deps-missing")
+      if r.len == 2:
+        expect reportField(r[0], "nimsem") >= 1,
+               "deps-missing: nimsem did not re-run for a deleted .s.deps.nif"
+      expect fileExists(deps),
+             "deps-missing: the rebuild did not restore " & deps
+      let settled = run("deps-missing-settle")
+      if settled.len == 2:
+        expect reportField(settled[0], "total") == 0 and
+               reportField(settled[1], "total") == 0,
+               "deps-missing-settle: re-ran " &
+               $(reportField(settled[0], "total") + reportField(settled[1], "total")) &
+               " commands (expected 0)"
 
   # Phase 3: touch (no content change). Only interface files are written
   # unchanged-is-untouched (doc/internals/ic.md), so the touched module's own
@@ -314,7 +349,7 @@ proc incrementalTests*() =
   # `deps.backendDirName` keeps the two populations apart; assert that both
   # exist afterwards, that they disagree, and that the C build the native one
   # ran on top of came through untouched.
-  var phases = 10  # cold, noop, touch, edit, inline-dep, body-dep, generic-dep, options, dce-local, live-edit
+  var phases = 11  # cold, noop, deps-missing, touch, edit, inline-dep, body-dep, generic-dep, options, dce-local, live-edit
   let arkham = "bin" / "arkham".addFileExt(ExeExt)
   let nifasm = "bin" / "nifasm".addFileExt(ExeExt)
   if fileExists(arkham) and fileExists(nifasm):

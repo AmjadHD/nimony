@@ -1877,6 +1877,16 @@ proc generateSemInstructions(c: DepContext; v: Node; b: var Builder; isMain: boo
       b.addStrLit c.config.semmedFile(v.files[0], v.plugin, docMode)
     b.withTree "output":
       b.addStrLit c.config.indexFile(v.files[0], v.plugin, docMode)
+    # The `.s.deps.nif` is written by nimsem alongside the `.s.nif`, and the
+    # backend graph reads it unconditionally. It must be an output here too,
+    # or a missing deps file looks "up to date" whenever the semmed file is
+    # still present: the backend then fails to open it. The window is real
+    # while a const-eval sub-compile shares this nimcache with the outer
+    # frontend -- it can observe the outer nimsem's `.s.nif` after it is
+    # published but before the deps file is.
+    b.withTree "output":
+      b.addStrLit changeModuleExt(c.config.semmedFile(v.files[0], v.plugin, docMode),
+                                  ".s.deps.nif")
     # Outputs for cyclic group members:
     for i in 0 ..< v.cyclicFiles.len:
       let idx = v.cyclicFiles[i]
@@ -1884,6 +1894,9 @@ proc generateSemInstructions(c: DepContext; v: Node; b: var Builder; isMain: boo
         b.addStrLit c.config.semmedFile(v.files[idx], v.plugin, docMode)
       b.withTree "output":
         b.addStrLit c.config.indexFile(v.files[idx], v.plugin, docMode)
+      b.withTree "output":
+        b.addStrLit changeModuleExt(c.config.semmedFile(v.files[idx], v.plugin, docMode),
+                                    ".s.deps.nif")
 
 proc generatePluginSemInstructions(c: DepContext; v: Node; b: var Builder) =
   #[ An import plugin fills `nimcache/<plugin>` for us. It is our job to
