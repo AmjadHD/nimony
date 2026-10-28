@@ -249,7 +249,8 @@ proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   let decl = doc.nodes[resolved[0]]
   let kindName = if decl.declarationKind.len > 0: decl.declarationKind else: "symbol"
   var value = "`" & kindName & " " & decl.text & "`"
-  let docs = doc.docCommentAt(doc.path, decl.range.startLine + 1)
+  let docs = declarationDoc(doc, doc.path, decl.range.startLine + 1,
+                            decl.declarationKind)
   if docs.len > 0:
     if docs.contains("\n"):
       value.add "\n\n```nim\n" & docs & "\n```"

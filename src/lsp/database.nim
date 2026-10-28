@@ -921,6 +921,19 @@ proc docCommentAt*(doc: Document; source: string; lineNo: int): string =
     if belowDoc.len > 0: return belowDoc
   ""
 
+proc declarationDoc*(doc: Document; source: string; lineNo: int;
+                     kind: string): string =
+  ## The doc block that belongs to a declaration.
+  ##
+  ## `docCommentAt` looks below the declaration, which is where a Nim doc
+  ## comment lives. Parameters and generic parameters are declared in a routine's
+  ## head, though, so the block below that head is the ROUTINE's documentation.
+  ## Reading it as a parameter's made a parameter hover display the proc's docs;
+  ## these declarations have no body of their own to document.
+  case kind
+  of "param", "staticParam", "typevar", "staticTypevar": ""
+  else: doc.docCommentAt(source, lineNo)
+
 proc positionOffset(doc: Document; line, character: int): int =
   result = 0
   var currentLine = 0
@@ -1343,7 +1356,7 @@ proc symbolFromFields(doc: Document; fields: seq[string];
   except:
     return
   result.doc = if fields[2] == "module": moduleDocAt(doc, source)
-               else: doc.docCommentAt(source, lineNo)
+               else: declarationDoc(doc, source, lineNo, fields[2])
   result.signature = signatureFor(doc, source, fields[2], fields[1], lineNo, column)
   result.range = doc.sourceRange(source, lineNo, column, fields[1])
 
@@ -1450,7 +1463,7 @@ proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
           if needSource:
             symbol.uri = doc.uriForPath(source)
             symbol.range = doc.sourceRange(source, lineNo, column, fields[1])
-            symbol.doc = doc.docCommentAt(source, lineNo)
+            symbol.doc = declarationDoc(doc, source, lineNo, fields[2])
           addSymbol(result, fields[0], symbol)
           continue
         for id in resolved:
@@ -1462,12 +1475,13 @@ proc parseIdeSnapshot*(doc: Document; content: string; queryLine,
           if needSource:
             symbol.uri = doc.uri
             symbol.range = n.range
-            symbol.doc = doc.docCommentAt(doc.path, n.range.startLine + 1)
+            symbol.doc = declarationDoc(doc, doc.path, n.range.startLine + 1,
+                                        fields[2])
           addSymbol(result, fields[0], symbol)
       elif source.len > 0 and needSource:
         addSymbol(result, fields[0], SemanticSymbol(name: fields[1], kind: fields[2],
           uri: doc.uriForPath(source),
-          doc: doc.docCommentAt(source, lineNo),
+          doc: declarationDoc(doc, source, lineNo, fields[2]),
           range: doc.sourceRange(source, lineNo, column, fields[1])))
       else:
         # A `visible` row falls through to here too, and wants no source at all.
@@ -1502,7 +1516,7 @@ proc symbolAtInfo(doc: Document; name, kind: string; lineNo, column: int;
                  module: moduleQualifier(doc, source, kind),
                  signature: signatureFor(doc, source, kind, name, lineNo, column),
                  range: doc.sourceRange(source, lineNo, column, name),
-                 doc: doc.docCommentAt(source, lineNo))
+                 doc: declarationDoc(doc, source, lineNo, kind))
 
 proc symbolForSym(doc: Document; sym: IdeSymbol; moduleSuffix: string;
                   queryLine, queryCharacter: int;
@@ -1544,7 +1558,8 @@ proc symbolForSym(doc: Document; sym: IdeSymbol; moduleSuffix: string;
     # Keep the declaration-derived module and signature from `symbolAtInfo`;
     # cursor resolution only changes the occurrence's range and its doc lookup.
     result.range = n.range
-    result.doc = doc.docCommentAt(doc.path, n.range.startLine + 1)
+    result.doc = declarationDoc(doc, doc.path, n.range.startLine + 1,
+                                $sym.kind)
 
 proc snapshotFromQuery*(doc: Document; res: IdeQueryResult; queryLine,
                         queryCharacter: int): SemanticSnapshot {.raises.} =

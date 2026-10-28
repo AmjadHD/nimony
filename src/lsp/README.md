@@ -270,6 +270,11 @@ answer with the next field's. Nim's own docgen draws the line in the same place.
 A block that starts its own line below belongs to the declaration above it, which
 is how the in-body form of the same comment is written.
 
+Parameters are the exception. A parameter is declared in a routine's head, so the
+block below that head belongs to the routine; the parameter has no body of its
+own. `declarationDoc` leaves parameters and generic parameters undocumented rather
+than attaching the routine's block to them.
+
 A field is the one symbol this lookup needs help placing. Its symbol is local
 (`x.0`, no module suffix), so the module index has no row for it, and it lives in
 its object type's scope, which no walk of the finished module reaches. Sem

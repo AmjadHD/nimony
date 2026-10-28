@@ -132,6 +132,14 @@ let zzPUse = zzProc
 let useVar = zzVar
 let useLet = zzLet
 let useConst = zzConst
+
+proc zzParamProc*(argValue: int; argOther: string = "x"): int =
+  ## Doc for zzParamProc.
+  let zzLocal = argValue
+  let zzLocalUse = zzLocal
+  zzLocalUse
+
+let zzParamCall = zzParamProc(1)
 """
 
 proc hoverAt(c: var Checker; src, needle: string; line, occurrence = 1): string {.raises.} =
@@ -274,6 +282,35 @@ proc checkMain() {.raises.} =
   checkDeclarationRange(c, Main, "zzVar", lineOf(Main, "zzVar*: int"))
   checkDeclarationRange(c, Main, "zzLet", lineOf(Main, "zzLet* = 5"))
   checkDeclarationRange(c, Main, "zzConst", lineOf(Main, "zzConst* = 6"))
+
+  # Parameters and locals are recorded outside the module's declaration list.
+  # A parameter declaration lives in the proc's signature, and a local's scope
+  # is not the module index, so these are the two places a hover can lose the
+  # symbol even though a top-level declaration answers.
+  let paramLine = lineOf(Main, "proc zzParamProc")
+  let paramCol = colOf(Main, "argValue", paramLine)
+  let localLine = lineOf(Main, "let zzLocal =")
+  let localCol = colOf(Main, "zzLocal", localLine)
+  checkDeclarationRange(c, Main, "argValue", paramLine)
+  checkDeclarationRange(c, Main, "zzLocal", localLine)
+
+  let paramUse = c.hoverAt(Main, "argValue", localLine)
+  assert paramUse.contains("`param argValue`"),
+         "a parameter use is not labeled as a parameter: " & paramUse
+  assert paramUse.contains(startsAt(paramLine, paramCol)),
+         "a parameter use points somewhere other than its declaration: " & paramUse
+  assert not paramUse.contains("Doc for zzParamProc."),
+         "a parameter inherited the routine's body doc: " & paramUse
+  let paramDecl = c.hoverAt(Main, "argValue", paramLine)
+  assert not paramDecl.contains("Doc for zzParamProc."),
+         "a parameter declaration inherited the routine's body doc: " & paramDecl
+
+  let localUseLine = lineOf(Main, "let zzLocalUse =")
+  let localUse = c.hoverAt(Main, "zzLocal", localUseLine, 2)
+  assert localUse.contains("`let zzLocal`"),
+         "a local use is not labeled as a let: " & localUse
+  assert localUse.contains(startsAt(localLine, localCol)),
+         "a local use points somewhere other than its declaration: " & localUse
 
 try:
   checkMain()
