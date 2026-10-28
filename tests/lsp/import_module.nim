@@ -77,6 +77,14 @@ const
   ## site, where a typo would read as a check that can never fail.
   NullAnswer = "\"result\":null}"
   EmptyArray = "\"result\":[]}"
+  BlockDocHelper = """##[ A block-documented module.
+      It spans lines and keeps its shape. ]##
+
+proc blockDocAnswer*(): int = 1
+"""
+  OneLineDocHelper = """## A one-line module doc.
+proc oneLineDocAnswer*(): int = 1
+"""
 
 proc checkBoth(c: var Checker; src, needle: string; line, occurrence = 1;
                what, mustContain: string) {.raises.} =
@@ -192,6 +200,33 @@ proc checkModuleWithoutDocShowsNone() {.raises.} =
   assert not hover.contains("\\n\\n"),
          "a module with no doc comment showed a doc anyway: " & hover
 
+proc checkHeadDocsSurviveTheFirstContentLine() {.raises.} =
+  ## A module's doc block is identified by its first line, but the index stores
+  ## line keys 1-based while `lines` is 0-based. The first content line of a
+  ## `##[` block is therefore the line where a non-doc line scan would stop, and
+  ## comparing the two coordinates directly lost the block. The same off-by-one
+  ## loses a one-line `##` immediately followed by code. Both forms have to
+  ## answer, and both helpers are deliberately written without a blank line
+  ## between the doc and the first declaration.
+  discard initDatabase(getCurrentDir())
+  writeFile(workDir() / "blockdoc_helper.nim", BlockDocHelper)
+  writeFile(workDir() / "onelinemod_helper.nim", OneLineDocHelper)
+
+  let blockSrc = "import blockdoc_helper\n"
+  var blockdoc = openChecked(blockSrc, "imp_blockmoddoc.nim")
+  let blockHover = blockdoc.ask("textDocument/hover", 0,
+                               colOf(blockSrc, "blockdoc_helper", 0))
+  assert blockHover.contains("A block-documented module.") and
+         blockHover.contains("It spans lines"),
+         "a block module doc was not found: " & blockHover
+
+  let oneSrc = "import onelinemod_helper\n"
+  var one = openChecked(oneSrc, "imp_onelinemoddoc.nim")
+  let oneHover = one.ask("textDocument/hover", 0,
+                         colOf(oneSrc, "onelinemod_helper", 0))
+  assert oneHover.contains("A one-line module doc."),
+         "a one-line module doc immediately above code was not found: " & oneHover
+
 proc checkSignatureIsShown() {.raises.} =
   ## Hover used to read "proc os.getAppFilename", which says nothing about what
   ## the proc takes or gives back. The tail after the name -- "(): string" -- is
@@ -300,6 +335,7 @@ try:
   checkSymbolIsQualified()
   checkModuleDocIsTheModulesOwn()
   checkModuleWithoutDocShowsNone()
+  checkHeadDocsSurviveTheFirstContentLine()
   checkSignatureIsShown()
 except:
   assert false, "module-name/signature query test failed"

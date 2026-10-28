@@ -1042,11 +1042,16 @@ proc moduleDocAt(doc: Document; source: string): string =
   if source.len == 0 or source == doc.path: return ""
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
   let index = doc.fileIndex(path)
-  var firstCode = index.lines.len
+  # `docs` is keyed by the lexer's 1-based line numbers; `lines` is 0-based.
+  # Convert here so the header boundary is compared in the same coordinate
+  # system. Without that, a block comment's first content line (or a one-line
+  # `##` immediately followed by code) is mistaken for the first code line and
+  # the module doc is dropped.
+  var firstCode = index.lines.len + 1
   for i, line in uncheckedBorrow(index.lines):
     let trimmed = line.strip
     if trimmed.len > 0 and not trimmed.startsWith("#"):
-      firstCode = i
+      firstCode = i + 1
       break
   var earliest = high(int)
   var found = ""
