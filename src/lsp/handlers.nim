@@ -215,6 +215,15 @@ proc displayKind(raw: string): string =
   of "NoSym": ""
   else: raw
 
+proc completionDetail(symbol: SemanticSymbol): string =
+  ## The completion label is only the symbol's name, so the detail carries the
+  ## defining module. Two imports may export the same name; `proc strutils` tells
+  ## the reader which one this row is, while `proc` alone leaves them identical.
+  let shown = displayKind(symbol.kind)
+  if symbol.module.len == 0: shown
+  elif shown.len == 0: symbol.module
+  else: shown & " " & symbol.module
+
 proc hoverJson(doc: Document; nodeId: int; query: SemanticSnapshot): string =
   ## Signature line, then the declaration's doc comment when there is one.
   ## Editors show the markdown as a popup, so the doc text goes in as plain
@@ -283,7 +292,7 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
       let kind = if shown in ["proc", "func", "iterator", "method",
                               "template", "macro", "converter"]: 3 else: 20
       result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
-        ",\"detail\":" & quoteJson(shown) & "}"
+        ",\"detail\":" & quoteJson(completionDetail(symbol)) & "}"
     result.add "]}"
     return
   if query.documentMode:
@@ -300,7 +309,7 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
       let kind = if shown in ["proc", "func", "iterator", "method",
                               "template", "macro", "converter"]: 3 else: 6
       result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
-        ",\"detail\":" & quoteJson(shown) & "}"
+        ",\"detail\":" & quoteJson(completionDetail(symbol)) & "}"
     for id in doc.visible(line, character):
       let n = doc.nodes[id]
       if n.text in labels: continue
@@ -321,7 +330,7 @@ proc completionJson(doc: Document; line, character: int; query: SemanticSnapshot
       let kind = if shown in ["proc", "func", "iterator", "method",
                               "template", "macro", "converter"]: 3 else: 6
       result.add "{\"label\":" & quoteJson(name) & ",\"kind\":" & $kind &
-        ",\"detail\":" & quoteJson(shown) & "}"
+        ",\"detail\":" & quoteJson(completionDetail(symbol)) & "}"
   else:
     for id in doc.visible(line, character):
       let n = doc.nodes[id]

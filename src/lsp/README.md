@@ -65,6 +65,9 @@ Completion in document mode offers the recorded import table plus the names the
 lexical index finds in the local scope chain. It does not see module-level
 symbols declared in *other* files (that is what the import table is), and a name
 declared later in the file is offered the same way the lexical index offers it.
+The label is the bare name, so the detail carries the defining module after the
+kind (`proc strutils`); without it two imports that export one name would produce
+indistinguishable rows.
 
 After a dot, completion offers the **receiver's members**, read from its
 established type. This is the one cursor query that document mode cannot answer:
@@ -79,10 +82,12 @@ name that *has* been typed, `s.add`, is also preceded by a dot but is an ordinar
 recorded occurrence, and answering it from a cursor query would throw away the
 resolution — which is the wrong symbol whenever the name is overloaded.
 
-Coverage is enums only, for now: their fields hang directly off the type's body
-as `EfldY` symbols, so listing them needs no traversal. There is no counterpart to
-`findObjFieldConsiderVis` that enumerates an *object's* members, so an object
-receiver answers empty — which is 2v1's documented degradation, not a wrong list.
+Coverage is enum fields and object fields. An enum's fields hang directly off the
+type's body as `EfldY` symbols, so listing them needs no traversal. An object's
+are collected by `collectObjMembers`, with the same visibility rule
+`findObjFieldConsiderVis` uses: a private field is offered in the module that
+declares it and withheld from another. Nimony does not implement inheritance
+today, but the collector mirrors the lookup's base recursion for when it does.
 A receiver whose type is genuinely unknown (it came from a generic call with
 unbound typevars) is the same: no result, rather than the scope chain.
 The cursor-specific `--visible:FILE,LINE,COL` mode still exists and still

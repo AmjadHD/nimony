@@ -1333,10 +1333,11 @@ proc symbolFromFields(doc: Document; fields: seq[string];
   ##
   ## So it comes down to which handler reads them. Hover and go-to-definition read
   ## `candidates`, and need the documentation and the range. Completion reads
-  ## `imports`, `visible` and `dotMembers`, and reads NOTHING but `name` and
-  ## `kind` -- it builds a label and a detail string. Computing a doc comment for
-  ## a name the client will only ever display as a word is 99% waste, and it was
-  ## the largest remaining cost in the query path.
+  ## `imports`, `visible` and `dotMembers`, and reads `name`, `kind` and the
+  ## defining module derived from the row's file path -- it builds a label and a
+  ## detail string. Computing a doc comment for a name the client will only ever
+  ## display as a word is 99% waste, and it was the largest remaining cost in the
+  ## query path.
   ##
   ## Not lazy, which would be the general fix: a lazy field needs a `var` accessor
   ## and every call site rewritten, and the split here is knowable statically from

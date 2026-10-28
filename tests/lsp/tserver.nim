@@ -161,6 +161,17 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   assert semanticCompletion.response.contains("\"label\":\"local\"")
   assert semanticCompletion.response.contains("\"label\":\"global\"")
   assert semanticCompletion.response.contains("\"label\":\"contains\"")
+  # A completion's label is only the name, so the detail has to say which module
+  # defines it. `cmpIgnoreStyle` comes from std/strutils; the local `local` must
+  # not acquire a qualifier just because completion learned to carry one.
+  assert semanticCompletion.response.contains(
+           "\"label\":\"cmpIgnoreStyle\",\"kind\":3,\"detail\":\"func strutils\""),
+         "an imported completion lost its module qualifier: " &
+         semanticCompletion.response
+  assert semanticCompletion.response.contains(
+           "\"label\":\"local\",\"kind\":6,\"detail\":\"let\""),
+         "a local completion gained a module qualifier: " &
+         semanticCompletion.response
 
   let postDot = handle(db, """{"jsonrpc":"2.0","id":6,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":9,"character":9}}}""")
   note(responses, "postDot", postDot.response)
