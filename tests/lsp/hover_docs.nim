@@ -139,6 +139,21 @@ proc hoverAt(c: var Checker; src, needle: string; line, occurrence = 1): string 
   assert col >= 0, "needle '" & needle & "' is not on fixture line " & $line
   result = c.ask("textDocument/hover", line, col)
 
+proc startsAt(line, character: int): string =
+  "\"start\":{\"line\":" & $line & ",\"character\":" & $character & "}"
+
+proc checkDeclarationRange(c: var Checker; src, needle: string; line: int) {.raises.} =
+  ## Sem records a declaration's position at a marker after the name -- the
+  ## export `*` for var/let/const and the `=` for a type alias in these cases.
+  ## The range has to name the identifier the editor can underline.
+  let column = colOf(src, needle, line)
+  let response = c.hoverAt(src, needle, line)
+  let definition = c.ask("textDocument/definition", line, column)
+  assert response.contains(startsAt(line, column)) and
+         definition.contains(startsAt(line, column)),
+         "the declaration range does not start at `" & needle & "` on line " &
+         $line & ": hover " & response & ", definition " & definition
+
 proc checkMain() {.raises.} =
   # The helper has to be on disk before the importer is checked; registering it
   # as an open document is not needed, only its text.
@@ -251,6 +266,14 @@ proc checkMain() {.raises.} =
   let constUse2 = c.hoverAt(Main, "zzConst", lineOf(Main, "useConst"))
   assert constUse2.contains("Doc for zzConst."),
          "a const lost its doc: " & constUse2
+
+  # A declaration range must start at the name, even though sem records the
+  # marker after it for several toplevel declaration kinds. `sourceRange` is
+  # what turns the recorded position into the range the editor underlines.
+  checkDeclarationRange(c, Main, "ZzType", lineOf(Main, "ZzType* = object"))
+  checkDeclarationRange(c, Main, "zzVar", lineOf(Main, "zzVar*: int"))
+  checkDeclarationRange(c, Main, "zzLet", lineOf(Main, "zzLet* = 5"))
+  checkDeclarationRange(c, Main, "zzConst", lineOf(Main, "zzConst* = 6"))
 
 try:
   checkMain()

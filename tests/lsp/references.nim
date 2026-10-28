@@ -74,7 +74,12 @@ const lines = [
   "  discard c.field",                     # 34
   "",                                      # 35
   "proc missing() =",                      # 36
-  "  discard notThere"                     # 37
+  "  discard notThere",                    # 37
+  "",                                       # 38
+  "const TopConst = 1",                     # 39
+  "let useTop = TopConst",                  # 40
+  "",                                       # 41
+  "type TopAlias = int"                     # 42
 ]
 
 let source = lines.join("\n") & "\n"
@@ -285,6 +290,18 @@ proc runTests(inProcess: bool) {.raises.} =
   # itself. Without that rule every unresolved name would match every other, and
   # this is the row shape sem leaves for one (`Ident`, no candidates).
   check(db, uri, "an undeclared name", 37, 10, true, @[])
+
+  # Sem records a toplevel const's declaration at the marker after the name
+  # (`=` here, `*` when exported) and a type alias's at its `=`. The reference
+  # keys still match, but `includeDeclaration: false` can drop the declaration
+  # only when `sourceRange` has recovered the name from that marker. These cases
+  # failed by returning the declaration as a reference to itself.
+  check(db, uri, "a const declaration and its use", 39, 6, true,
+        @["39:6", "40:13"])
+  check(db, uri, "a const without its declaration", 39, 6, false,
+        @["40:13"])
+  check(db, uri, "a type alias declaration", 42, 5, true, @["42:5"])
+  check(db, uri, "a type alias without its declaration", 42, 5, false, @[])
 
   discard handle(db, closeRequest(uri))
 

@@ -507,8 +507,8 @@ proc spansOf(snapshot: SemanticSnapshot; name: string): seq[RefSpan] =
       # This span IS the declaration, rather than a use of it. A line comparison
       # alone would also swallow `proc f() = f()`, where the call is on the
       # declaration's line; the name's own span on that line excludes it, because
-      # sem records a declaration's column as the start of the line rather than of
-      # the name, and `sourceRange` recovers the name's real column from there.
+      # sem records a declaration's column at a marker after the name and
+      # `sourceRange` recovers the name's real column from the line.
       if p.line - 1 == s.range.startLine and
           p.column >= s.range.startCharacter and
           p.column < s.range.startCharacter + name.len:
@@ -963,7 +963,12 @@ proc sourceRange(doc: Document; source: string; line, col: int;
     let start = index.lineStarts[lineIdx]
     var stop = start
     while stop < text.len and text[stop] != '\n': inc stop
-    var i = min(stop, start + max(0, col))
+    # Sem's declaration info can point at the token AFTER the name -- `*` for an
+    # exported var/let/const and `=` for a type alias. Starting at `col` and
+    # scanning forward cannot recover a name that lies to its left, so search
+    # the whole line. Identifier boundaries keep `proc c` from matching the `c`
+    # inside the keyword.
+    var i = start
     while i + name.len <= stop:
       var matches = text.substr(i, i + name.len - 1) == name
       if name[0] in {'a'..'z', 'A'..'Z', '_'} or ord(name[0]) >= 0x80:
