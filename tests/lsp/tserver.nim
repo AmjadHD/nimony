@@ -141,7 +141,7 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   # `contains`; all three are occurrences the one-at-a-time capture never saw.
   var sawParam = false
   var sawImported = false
-  for position in doc.snapshot.positions:
+  for position in uncheckedBorrow(doc.snapshot.positions):
     if position.name == "local" and position.symbols.len > 0: sawParam = true
     if position.name == "contains" and position.symbols.len > 0: sawImported = true
   assert sawParam, "a local's use was not recorded"
@@ -149,7 +149,7 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   # The shapes the one-at-a-time capture missed: a parameter in a signature, a
   # field selected through a dot, and a type name from an import.
   var sawUnresolved = false
-  for position in doc.snapshot.positions:
+  for position in uncheckedBorrow(doc.snapshot.positions):
     if position.symbols.len == 0: sawUnresolved = true
   assert sawUnresolved
   let revisited = handle(db, """{"jsonrpc":"2.0","id":21,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///workspace/lsp-test.nim"},"position":{"line":8,"character":3}}}""")
@@ -314,7 +314,7 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   # on where `seqimpl` and `stringimpl` happen to live.
   var overloadSet = IdePosition(line: -1, column: -1)
   var overloadPick = IdePosition(line: -1, column: -1)
-  for position in overloadDoc.snapshot.positions:
+  for position in uncheckedBorrow(overloadDoc.snapshot.positions):
     if position.name != "add": continue
     if position.symbols.len == 1: overloadPick = position
     elif position.symbols.len > 1: overloadSet = position
@@ -409,7 +409,7 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   # whether an occurrence is there. It is routed by the request being a
   # completion.
   var recordedAtCursor = 0
-  for position in partialDoc.snapshot.positions:
+  for position in uncheckedBorrow(partialDoc.snapshot.positions):
     if position.line == 6: recordedAtCursor = position.symbols.len
   assert recordedAtCursor == 0,
          "a half-typed member was expected to record no symbol here"

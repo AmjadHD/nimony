@@ -723,7 +723,7 @@ proc semanticErrors*(content: string): seq[ParseDiagnostic] =
 
 proc nodeAt*(doc: Document; line, character: int): int =
   result = -1
-  for n in doc.nodes:
+  for n in uncheckedBorrow(doc.nodes):
     if n.range.startLine == line and character >= n.range.startCharacter and
         character < n.range.endCharacter:
       return n.id
@@ -745,7 +745,7 @@ proc resolve*(doc: Document; nodeId: int): seq[int] =
   let target = doc.nodes[nodeId]
   if doc.isMemberAccess(target.range.startLine, target.range.startCharacter): return
   var nearestDepth = -1
-  for candidate in doc.nodes:
+  for candidate in uncheckedBorrow(doc.nodes):
     if candidate.declarationKind.len == 0 or candidate.text != target.text: continue
     if not doc.scopeContains(candidate.scope, target.scope): continue
     if candidate.scope != 0 and candidate.startOffset > target.startOffset: continue
@@ -1043,14 +1043,14 @@ proc moduleDocAt(doc: Document; source: string): string =
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
   let index = doc.fileIndex(path)
   var firstCode = index.lines.len
-  for i, line in index.lines:
+  for i, line in uncheckedBorrow(index.lines):
     let trimmed = line.strip
     if trimmed.len > 0 and not trimmed.startsWith("#"):
       firstCode = i
       break
   var earliest = high(int)
   var found = ""
-  for line, docText in index.docs:
+  for line, docText in uncheckedBorrow(index.docs):
     if line < firstCode and line < earliest:
       earliest = line
       found = docText
@@ -1810,7 +1810,7 @@ proc scopeAtLine(doc: Document; line: int): int =
     inc i
   result = 0
   var bestIndent = -1
-  for scope in doc.scopes:
+  for scope in uncheckedBorrow(doc.scopes):
     if scope.indent <= indent and scope.indent > bestIndent:
       bestIndent = scope.indent
       result = scope.id
@@ -1823,7 +1823,7 @@ proc resolveNameAt(doc: Document; name: string; line, character: int): seq[int] 
   let offset = if nodeId >= 0: doc.nodes[nodeId].startOffset
                else: doc.positionOffset(line, character)
   var nearestDepth = -1
-  for candidate in doc.nodes:
+  for candidate in uncheckedBorrow(doc.nodes):
     if candidate.declarationKind.len == 0 or candidate.text != name: continue
     if not doc.scopeContains(candidate.scope, scope): continue
     if candidate.scope != 0 and candidate.startOffset > offset: continue
@@ -1844,7 +1844,7 @@ proc visible*(doc: Document; line, character: int): seq[int] =
   let offset = if nodeId >= 0: doc.nodes[nodeId].startOffset
                else: doc.positionOffset(line, character)
   var bestDepth = initTable[string, int]()
-  for n in doc.nodes:
+  for n in uncheckedBorrow(doc.nodes):
     if n.declarationKind.len == 0: continue
     if n.scope != 0 and n.startOffset > offset: continue
     if not doc.scopeContains(n.scope, scope): continue
@@ -1855,7 +1855,7 @@ proc visible*(doc: Document; line, character: int): seq[int] =
       parent = doc.scopes[parent].parent
     if depth > bestDepth.getOrDefault(n.text, -1):
       bestDepth[n.text] = depth
-  for n in doc.nodes:
+  for n in uncheckedBorrow(doc.nodes):
     if n.declarationKind.len == 0 or n.scope != 0 and n.startOffset > offset: continue
     if not doc.scopeContains(n.scope, scope): continue
     var depth = 0

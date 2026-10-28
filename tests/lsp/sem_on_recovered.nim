@@ -64,9 +64,9 @@ proc checkRecovered(label, text: string) {.raises.} =
   let doc = db.document(uri)
   assert doc != nil, label & ": the document was not registered: " & opened.notification
   var unique = initHashSet[string]()
-  for d in doc.diagnostics:
+  for d in uncheckedBorrow(doc.diagnostics):
     unique.incl $d.line & ":" & $d.col & ":" & d.message
-  for d in doc.semanticDiagnostics:
+  for d in uncheckedBorrow(doc.semanticDiagnostics):
     unique.incl $d.line & ":" & $d.col & ":" & d.message
   assert count == unique.len,
          label & ": published " & $count & " diagnostics for " & $unique.len &

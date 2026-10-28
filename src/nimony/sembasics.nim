@@ -218,7 +218,7 @@ proc ideSymbol*(c: var SemContext; dest: TokenBuf; id: SymId): IdeSymbol =
   result = IdeSymbol(id: id, kind: NoSym, info: NoLineInfo)
   var scope = c.currentScope
   while scope != nil:
-    for _, symbols in scope.tab:
+    for _, symbols in uncheckedBorrow(scope.tab):
       for sym in symbols:
         if sym.name == id:
           result.kind = sym.kind
@@ -263,7 +263,7 @@ proc visibleSymbolsAtCursor*(c: var SemContext; dest: TokenBuf;
   var names = initHashSet[StrId]()
   var scope = c.currentScope
   while scope != nil:
-    for name in keys(scope.tab): names.incl name
+    for name in keys(uncheckedBorrow(scope.tab)): names.incl name
     scope = scope.up
   for name in keys(c.importTab): names.incl name
 
