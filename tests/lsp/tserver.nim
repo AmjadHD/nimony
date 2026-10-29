@@ -531,6 +531,33 @@ proc runTests(responses: var Table[string, string]; inProcess: bool) {.raises.} 
   assert not nestedHover.response.contains("Documents this declaration"),
          "a later declaration took the block above it: " & nestedHover.response
 
+  # The server-facing half of coalescing. A change with `deferChanges` parses
+  # the buffer but publishes nothing; `flushDiagnostics` is the one check that
+  # later turns the dirty document into a notification. The default path above
+  # still compiles each change inline, which is the contract handlers keep for
+  # callers that do not opt into the server's quiet-period policy.
+  let coalesceUri = "file:///workspace/lsp-coalesce.nim"
+  let coalesceOpened = handle(db,
+    """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/lsp-coalesce.nim","version":1,"text":"let coalesced = 1\n"}}}""",
+    deferChanges = true)
+  assert coalesceOpened.notification.contains("publishDiagnostics")
+  let coalesceChanged = handle(db,
+    """{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///workspace/lsp-coalesce.nim","version":2},"contentChanges":[{"text":"let coalesced = \"bad\"\n"}]}}""",
+    deferChanges = true)
+  assert coalesceChanged.notification.len == 0,
+         "a deferred change published before its check: " & coalesceChanged.notification
+  let coalesceDoc = db.document(coalesceUri)
+  assert coalesceDoc.dirty, "a deferred change was not marked dirty"
+  let coalescedDiagnostics = flushDiagnostics(db)
+  assert coalescedDiagnostics.len == 1,
+         "the deferred check produced " & $coalescedDiagnostics.len &
+         " notifications"
+  assert coalescedDiagnostics[0].contains("publishDiagnostics")
+  assert not coalesceDoc.dirty, "a flushed document stayed dirty"
+  discard handle(db,
+    """{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/lsp-coalesce.nim"}}}""",
+    deferChanges = true)
+
 proc runBothPaths() {.raises.} =
   ## The same request sequence down both sem paths, and the answers compared.
   ##

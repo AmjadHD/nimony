@@ -160,10 +160,29 @@ proc uriPath(uriText: string): string {.raises.} =
     return rest[1 .. ^1]
   rest
 
-proc publishDiagnostics(doc: Document): string =
+proc publishDiagnostics*(doc: Document): string =
   "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{" &
     "\"uri\":" & quoteJson(doc.uri) & ",\"diagnostics\":" &
     diagnosticsJson(doc) & "}}"
+
+proc flushDiagnostics*(db: var Database): seq[string] {.raises.} =
+  ## Check every document whose text changed since its last check, and return
+  ## one publish notification per document. The server calls this when the edit
+  ## stream goes quiet, and before a query that must not read a stale snapshot.
+  ##
+  ## The URI list is copied first: `runDiagnostics` touches the document, and
+  ## walking the table while doing that makes the borrow checker (rightly)
+  ## complain. A document can disappear between the copy and the loop only if
+  ## the server handles a close concurrently, which it does not.
+  result = @[]
+  var pending: seq[string] = @[]
+  for uri in db.documents.keys:
+    pending.add uri
+  for uri in pending:
+    var doc = db.document(uri)
+    if doc != nil and doc.dirty:
+      db.runDiagnostics(doc)
+      result.add publishDiagnostics(doc)
 
 proc docPosition(params: JsonNode): tuple[line, character: int] =
   let pos = field(params, "position")
@@ -382,7 +401,22 @@ proc referencesJson(locations: seq[ReferenceLocation]): string =
       ",\"range\":" & rangeJson(location.range) & "}"
   result.add ']'
 
-proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
+proc requestMethod*(body: string): string {.raises.} =
+  ## The server needs the method before it dispatches: a query arriving after a
+  ## deferred change must force that change's check first. A malformed message
+  ## has no method, and `handle` remains the place that decides what to do with
+  ## it.
+  result = ""
+  try:
+    var parsed = parseJson(body)
+    let msg = parsed.root
+    if not msg.isEmpty and kind(msg) == JObject:
+      result = msg.strField("method")
+  except:
+    discard
+
+proc handle*(db: var Database; body: string;
+             deferChanges = false): HandlerResult {.raises.} =
   result = HandlerResult(response: "", notification: "", stop: false)
   var parsed = parseJson(body)
   let msg = parsed.root
@@ -423,8 +457,14 @@ proc handle*(db: var Database; body: string): HandlerResult {.raises.} =
           for change in items(changes): source = change.strField("text")
     let version = int(td.intField("version"))
     var doc = db.updateDocument(uriText, uriPath(uriText), version, source)
-    db.runDiagnostics(doc)
-    result.notification = publishDiagnostics(doc)
+    # A change only marks the parsed document dirty. The server waits for the
+    # keystroke burst to end and then calls `flushDiagnostics`; a query in the
+    # meantime flushes first, so it never reads the empty snapshot of a
+    # not-yet-checked version. `deferChanges` defaults to false for callers that
+    # want the synchronous handler contract (the tests do).
+    if not (deferChanges and methodName == "textDocument/didChange"):
+      db.runDiagnostics(doc)
+      result.notification = publishDiagnostics(doc)
   of "textDocument/didClose":
     let uriText = field(params, "textDocument").strField("uri")
     db.closeDocument(uriText)

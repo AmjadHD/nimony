@@ -68,6 +68,7 @@ type
     workspaceRoot*: string
     version*: int
     text*: string
+    dirty*: bool ## parsed for this version, but not checked yet
     nodes*: seq[SyntaxNode]
     scopes*: seq[ScopeNode]
     diagnostics*: seq[ParseDiagnostic]       ## from the recovering parser
@@ -296,6 +297,7 @@ proc runDiagnostics*(db: var Database; doc: var Document) {.raises.} =
   ## on every cursor move.
   doc.queryLine = -1
   doc.queryCharacter = -1
+  doc.dirty = false
   if semInProcess() and db.dependencyClosureReady(doc):
     try:
       let res = db.runSemInProcess(doc, -1, -1)
@@ -331,7 +333,7 @@ proc runDiagnostics*(db: var Database; doc: var Document) {.raises.} =
 proc updateDocument*(db: var Database; uri, path: string; version: int;
                      text: string): Document {.raises.} =
   var doc = Document(uri: uri, path: path, workspaceRoot: db.root,
-                     version: version, text: text)
+                     version: version, text: text, dirty: true)
   var p = openParser(text, path, pool, globalTags)
   p.recovering = true
   parseModule p
