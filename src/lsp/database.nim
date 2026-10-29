@@ -1057,8 +1057,6 @@ proc moduleDocAt(doc: Document; source: string): string =
   ## without that test is how `os` came to document `fileExists`.
   ##
   ## Empty for the open document, which is not a thing you can import from here.
-  ## A block comment spanning lines is not recognised, so a module documented
-  ## inside one gets nothing rather than the wrong block.
   if source.len == 0 or source == doc.path: return ""
   let path = if source.isAbsolute: source else: doc.workspaceRoot / source
   let index = doc.fileIndex(path)
